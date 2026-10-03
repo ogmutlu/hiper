@@ -1,5 +1,6 @@
 import argparse
 import datetime as dt
+import math
 import os
 import random
 import subprocess
@@ -7,12 +8,12 @@ import sys
 import time
 
 from .. import config, storage
-from . import Command
-from .set import (
+from ..defaults import (
     DEFAULT_COUNTDOWN,
     DEFAULT_PAUSE_END_MUSIC,
     DEFAULT_PAUSE_LENGTH,
 )
+from . import Command
 
 
 def pause_configure_parser(p: argparse.ArgumentParser) -> None:
@@ -44,7 +45,7 @@ def pause_run(args: argparse.Namespace) -> int:
     try:
         duration_seconds = storage.parse_duration(duration_str)
     except ValueError as e:
-        print(f"Error: invalid duration '{duration_str}': {e}", file=sys.stderr)  # type: ignore[arg-type]
+        print(f"Error: invalid duration '{duration_str}': {e}", file=sys.stderr)
         return 1
 
     start_time = dt.datetime.now()
@@ -61,6 +62,7 @@ def pause_run(args: argparse.Namespace) -> int:
     print(f"Will end at: {end_time.strftime('%H:%M:%S')}")
 
     # Wait for the duration with optional countdown
+    deadline = time.monotonic() + duration_seconds
     try:
         if countdown_enabled:
             # Show countdown timer
@@ -73,7 +75,7 @@ def pause_run(args: argparse.Namespace) -> int:
                     flush=True,
                 )
                 time.sleep(1)
-                remaining_seconds -= 1
+                remaining_seconds = max(0, math.ceil(deadline - time.monotonic()))
             print()  # New line after countdown completes
         else:
             print("Waiting... Press Ctrl+C to interrupt", end="", flush=True)
@@ -85,8 +87,9 @@ def pause_run(args: argparse.Namespace) -> int:
         else:
             print("\nPause discarded")
         print("---------------------------------")
-        return 0
+        return 130
 
+    end_time = dt.datetime.now()
     # Signal the end of the pause
     print("\nPAUSE ENDED!")
     print(f"Started at: {start_time.strftime('%H:%M:%S')}")
@@ -126,7 +129,7 @@ def pause_run(args: argparse.Namespace) -> int:
         if not os.path.exists(music_path):
             print(
                 f"Error: music file or folder not found: {music_path}", file=sys.stderr
-            )  # type: ignore[arg-type]
+            )
             print("---------------------------------")
             return 0
 
@@ -136,12 +139,13 @@ def pause_run(args: argparse.Namespace) -> int:
             files = [
                 f
                 for f in os.listdir(music_path)
-                if os.path.isfile(os.path.join(music_path, f))
+                if f.lower().endswith(".mp3")
+                and os.path.isfile(os.path.join(music_path, f))
             ]
             if not files:
                 print(
                     f"Error: no files found in directory: {music_path}", file=sys.stderr
-                )  # type: ignore[arg-type]
+                )
                 print("---------------------------------")
                 return 0
             # Pick a random file
@@ -162,7 +166,7 @@ def pause_run(args: argparse.Namespace) -> int:
             print(
                 "Error: VLC not found. Please install VLC media player.",
                 file=sys.stderr,
-            )  # type: ignore[arg-type]
+            )
             print("---------------------------------")
             return 0
 
@@ -179,7 +183,7 @@ def pause_run(args: argparse.Namespace) -> int:
             # Clear the line to hide ^C
             print("\r\033[K", end="", flush=True)
         except Exception as e:
-            print(f"Error playing music: {e}", file=sys.stderr)  # type: ignore[arg-type]
+            print(f"Error playing music: {e}", file=sys.stderr)
 
     print("---------------------------------")
     return 0

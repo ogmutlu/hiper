@@ -1,9 +1,10 @@
 import argparse
 import datetime as dt
-from typing import Dict, Optional
 
 from .. import messages as msgs
 from .. import storage
+from ..models import Session
+from ..timeutil import local_datetime
 from . import Command
 
 
@@ -11,53 +12,35 @@ def _parse_duration(s: str) -> int:
     return storage.parse_duration(s)
 
 
-def _get_duration(row: Dict[str, object]) -> int:
-    """Safely extract duration from a row dictionary."""
-    duration = row.get("duration", 0)
-    if isinstance(duration, int):
-        return duration
-    if isinstance(duration, str):
-        try:
-            return int(duration)
-        except ValueError:
-            return 0
-    return 0
+def _get_duration(row: Session) -> int:
+    return row["duration"]
 
 
-def _get_start(row: Dict[str, object]) -> Optional[dt.datetime]:
-    """Safely extract start datetime from a row dictionary."""
-    start = row.get("start")
-    if isinstance(start, dt.datetime):
-        return start
-    return None
+def _get_start(row: Session) -> dt.datetime | None:
+    return row["start"]
 
 
-def _parse_start(s: Optional[str], duration_s: int) -> dt.datetime:
+def _parse_start(s: str | None, duration_s: int) -> dt.datetime:
     if not s:
-        # default: end now, infer start
         end = dt.datetime.now()
         return end - dt.timedelta(seconds=duration_s)
     s = s.strip()
-    # Try ISO first
     try:
-        return dt.datetime.fromisoformat(s)
-    except Exception:
+        return local_datetime(s)
+    except ValueError:
         pass
-    # Try HH:MM today
     try:
-        hh, mm, *_ = s.split(":")
+        hh, mm = s.split(":")
         now = dt.datetime.now()
         return now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
-    except Exception:
+    except ValueError:
         pass
     raise ValueError("start must be ISO datetime or HH:MM")
 
 
 def postfokus_configure_parser(p: argparse.ArgumentParser) -> None:
     p.add_argument(
-        "--duration",
-        "-d",
-        help="Duration (e.g., 25m, 1h30m, 1h30s, 1500s).",
+        "--duration", "-d", help="Duration (e.g., 25m, 1h30m, 1h30s, 1500s)."
     )
     p.add_argument(
         "--start",
@@ -75,11 +58,7 @@ def postfokus_configure_parser(p: argparse.ArgumentParser) -> None:
         help="Session title. With no --duration, filters statistics to this title.",
         default=None,
     )
-    p.add_argument(
-        "--titles",
-        action="store_true",
-        help="Show per-title breakdown",
-    )
+    p.add_argument("--titles", action="store_true", help="Show per-title breakdown")
     p.add_argument(
         "--since",
         help="Only include sessions starting on/after this date (YYYY-MM-DD).",
@@ -96,11 +75,9 @@ def postfokus_configure_parser(p: argparse.ArgumentParser) -> None:
 
 
 def _filter_rows_range(
-    rows: list[Dict[str, object]],
-    since: Optional[dt.date],
-    until: Optional[dt.date],
-) -> list[Dict[str, object]]:
-    filtered: list[Dict[str, object]] = []
+    rows: list[Session], since: dt.date | None, until: dt.date | None
+) -> list[Session]:
+    filtered: list[Session] = []
     for r in rows:
         start = _get_start(r)
         if start is None:
@@ -114,28 +91,28 @@ def _filter_rows_range(
     return filtered
 
 
-def _parse_since(since_str: Optional[str]) -> Optional[dt.date]:
+def _parse_since(since_str: str | None) -> dt.date | None:
     if not since_str:
         return None
     try:
         return dt.datetime.strptime(since_str.strip(), "%Y-%m-%d").date()
-    except Exception:
-        raise ValueError("since must be YYYY-MM-DD")
+    except ValueError:
+        raise ValueError("since must be YYYY-MM-DD") from None
 
 
-def _parse_until(until_str: Optional[str]) -> Optional[dt.date]:
+def _parse_until(until_str: str | None) -> dt.date | None:
     if not until_str:
         return None
     try:
         return dt.datetime.strptime(until_str.strip(), "%Y-%m-%d").date()
-    except Exception:
-        raise ValueError("until must be YYYY-MM-DD")
+    except ValueError:
+        raise ValueError("until must be YYYY-MM-DD") from None
 
 
 def _print_statistics(
-    title_filter: Optional[str] = None,
-    since: Optional[dt.date] = None,
-    until: Optional[dt.date] = None,
+    title_filter: str | None = None,
+    since: dt.date | None = None,
+    until: dt.date | None = None,
 ) -> int:
     rows = storage.load_sessions_csv()
     if title_filter:
@@ -154,17 +131,20 @@ def _print_statistics(
     today_seconds = sum(
         _get_duration(r)
         for r in rows
-        if (start := _get_start(r)) is not None and start >= today_start
+        if (start := _get_start(r)) is not None
+        and today_start.date() <= start.date() <= now.date()
     )
     week_seconds = sum(
         _get_duration(r)
         for r in rows
-        if (start := _get_start(r)) is not None and start >= last7_start
+        if (start := _get_start(r)) is not None
+        and last7_start.date() <= start.date() <= now.date()
     )
     month_seconds = sum(
         _get_duration(r)
         for r in rows
-        if (start := _get_start(r)) is not None and start >= last30_start
+        if (start := _get_start(r)) is not None
+        and last30_start.date() <= start.date() <= now.date()
     )
     avg_seconds = total_seconds // total_sessions if total_sessions else 0
     print("--------------------------------")
@@ -173,7 +153,6 @@ def _print_statistics(
     print(msgs.stats_line("today", storage.format_hms(today_seconds)))
     print(msgs.stats_line("last 7 days", storage.format_hms(week_seconds)))
     print(msgs.stats_line("last 30 days", storage.format_hms(month_seconds)))
-    # Averages per day (including today)
     min_date = None
     for r in rows:
         start = _get_start(r)
@@ -186,7 +165,7 @@ def _print_statistics(
     avg_per_day_all = total_seconds // days_total if days_total > 0 else 0
 
     def _avg_window(
-        start_date: dt.date, end_date: dt.date, rows_subset: list[Dict[str, object]]
+        start_date: dt.date, end_date: dt.date, rows_subset: list[Session]
     ) -> int:
         span_days = (end_date - start_date).days + 1
         if span_days <= 0:
@@ -200,33 +179,29 @@ def _print_statistics(
         for r in rows
         if (start := _get_start(r)) is not None
         and start.date() >= window_start_7
-        and start.date() <= today_start.date()
+        and (start.date() <= today_start.date())
     ]
     avg_per_day_last7 = _avg_window(window_start_7, today_start.date(), window_rows_7)
-
     window_start_30 = last30_start.date()
     window_rows_30 = [
         r
         for r in rows
         if (start := _get_start(r)) is not None
         and start.date() >= window_start_30
-        and start.date() <= today_start.date()
+        and (start.date() <= today_start.date())
     ]
     avg_per_day_last30 = _avg_window(
         window_start_30, today_start.date(), window_rows_30
     )
-
     print(msgs.stats_line("average per day", storage.format_hms(avg_per_day_all)))
     print(
         msgs.stats_line(
-            "average per day last 7 days",
-            storage.format_hms(avg_per_day_last7),
+            "average per day last 7 days", storage.format_hms(avg_per_day_last7)
         )
     )
     print(
         msgs.stats_line(
-            "average per day last 30 days",
-            storage.format_hms(avg_per_day_last30),
+            "average per day last 30 days", storage.format_hms(avg_per_day_last30)
         )
     )
     print(msgs.stats_line("average session length", storage.format_hms(avg_seconds)))
@@ -234,9 +209,9 @@ def _print_statistics(
 
 
 def _print_table(
-    title_filter: Optional[str] = None,
-    since: Optional[dt.date] = None,
-    until: Optional[dt.date] = None,
+    title_filter: str | None = None,
+    since: dt.date | None = None,
+    until: dt.date | None = None,
     by_title: bool = False,
 ) -> int:
     """Print daily statistics in table format."""
@@ -244,30 +219,21 @@ def _print_table(
     if title_filter:
         rows = [r for r in rows if (r.get("title") or "") == title_filter]
     rows = _filter_rows_range(rows, since, until)
-
-    # Determine date range
     today = dt.date.today()
     if since and until:
-        # Both specified: use the range
         start_date = since
         end_date = until
     elif since:
-        # Only since: show from since to today (up to 10 days)
         start_date = since
         end_date = min(today, since + dt.timedelta(days=9))
     elif until:
-        # Only until: show last 10 days ending at until
         end_date = until
         start_date = end_date - dt.timedelta(days=9)
     else:
-        # Default: last 10 days (including today)
         end_date = today
         start_date = today - dt.timedelta(days=9)
-
-    # Group sessions by date
-    daily_totals: Dict[dt.date, int] = {}
-    daily_by_title: Dict[str, Dict[dt.date, int]] = {}
-
+    daily_totals: dict[dt.date, int] = {}
+    daily_by_title: dict[str, dict[dt.date, int]] = {}
     for r in rows:
         start = _get_start(r)
         if start is None:
@@ -275,12 +241,10 @@ def _print_table(
         session_date = start.date()
         if session_date < start_date or session_date > end_date:
             continue
-
         duration = _get_duration(r)
         if session_date not in daily_totals:
             daily_totals[session_date] = 0
         daily_totals[session_date] += duration
-
         if by_title:
             title_str = r.get("title")
             title = str(title_str).strip() if title_str else "(unnamed)"
@@ -289,9 +253,7 @@ def _print_table(
             if session_date not in daily_by_title[title]:
                 daily_by_title[title][session_date] = 0
             daily_by_title[title][session_date] += duration
-
     if by_title:
-        # Print table for each title
         print(msgs.stats_header("by title (daily table)"))
         titles = sorted(daily_by_title.keys())
         for title in titles:
@@ -300,12 +262,10 @@ def _print_table(
             title_table_parts: list[str] = []
             current_date = start_date
             while current_date <= end_date:
-                # Format date as "Thu 1 Jan" and pad to fixed width for alignment
                 day_name = current_date.strftime("%a")
-                day_num = str(current_date.day)  # Remove leading zero
+                day_num = str(current_date.day)
                 month_name = current_date.strftime("%b")
                 date_str = f"{day_name} {day_num} {month_name}"
-                # Pad date string to fixed width (e.g., "Thu 10 Jan" is longest)
                 date_str_padded = f"{date_str:12}"
                 duration_seconds = daily_by_title[title].get(current_date, 0)
                 if duration_seconds > 0:
@@ -319,7 +279,6 @@ def _print_table(
         print("--------------------------------")
         return 0
     else:
-        # Print single table
         if title_filter:
             print(msgs.stats_header(title_filter))
         else:
@@ -328,12 +287,10 @@ def _print_table(
         main_table_parts: list[str] = []
         current_date = start_date
         while current_date <= end_date:
-            # Format date as "Thu 1 Jan" and pad to fixed width for alignment
             day_name = current_date.strftime("%a")
-            day_num = str(current_date.day)  # Remove leading zero
+            day_num = str(current_date.day)
             month_name = current_date.strftime("%b")
             date_str = f"{day_name} {day_num} {month_name}"
-            # Pad date string to fixed width (e.g., "Thu 10 Jan" is longest)
             date_str_padded = f"{date_str:12}"
             duration_seconds = daily_totals.get(current_date, 0)
             if duration_seconds > 0:
@@ -349,7 +306,7 @@ def _print_table(
 
 
 def _print_statistics_by_title(
-    since: Optional[dt.date] = None, until: Optional[dt.date] = None
+    since: dt.date | None = None, until: dt.date | None = None
 ) -> int:
     rows = storage.load_sessions_csv()
     rows = _filter_rows_range(rows, since, until)
@@ -357,7 +314,7 @@ def _print_statistics_by_title(
     if not rows:
         print(msgs.stats_line("sessions", "0"))
         return 0
-    agg: Dict[str, Dict[str, int]] = {}
+    agg: dict[str, dict[str, int]] = {}
     for r in rows:
         title_str = r.get("title")
         title = str(title_str).strip() if title_str else ""
@@ -381,50 +338,45 @@ def postfokus_run(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(msgs.invalid_X(str(e), "since"))
         return 2
-
+    if since_date and until_date and (since_date > until_date):
+        raise ValueError("since must be on or before until")
     if not args.duration:
-        # No duration -> show statistics
         if args.table:
-            # Show table format
-            if args.titles and not args.title:
+            if args.titles and (not args.title):
                 return _print_table(None, since_date, until_date, by_title=True)
             return _print_table(
                 args.title or None, since_date, until_date, by_title=False
             )
-        if args.titles and not args.title:
+        if args.titles and (not args.title):
             return _print_statistics_by_title(since_date, until_date)
         return _print_statistics(args.title or None, since_date, until_date)
     try:
         duration_s = _parse_duration(args.duration)
-    except Exception as e:
+    except ValueError as e:
         print(msgs.invalid_X(str(e), "duration"))
         return 2
-    # Parse optional end first if provided
-    end: Optional[dt.datetime] = None
+    end: dt.datetime | None = None
     if args.end:
         try:
-            # Reuse start parser semantics (ISO or HH:MM today)
             end = _parse_start(args.end, duration_s)
-        except Exception as e:
+        except ValueError as e:
             print(msgs.invalid_X(str(e), "end"))
             return 2
-    # Parse or infer start
     try:
         if args.start:
             start = _parse_start(args.start, duration_s)
+        elif end is not None:
+            start = end - dt.timedelta(seconds=duration_s)
         else:
-            if end is not None:
-                start = end - dt.timedelta(seconds=duration_s)
-            else:
-                start = _parse_start(None, duration_s)
-    except Exception as e:
+            start = _parse_start(None, duration_s)
+    except ValueError as e:
         print(msgs.invalid_X(str(e), "start"))
         return 2
-    # Infer end if not provided
     if end is None:
         end = start + dt.timedelta(seconds=duration_s)
+    if end < start:
+        raise ValueError("session end must be on or after start")
     path = storage.save_session_csv(args.title or "", start, end, duration_s)
-
     print(msgs.saved_session_line(storage.format_hms(duration_s)))
     print(msgs.saved_path_line(path))
     return 0
@@ -437,4 +389,5 @@ def get_command() -> Command:
         description="Record a past focus session by providing duration and optional start time and title.",
         configure_parser=postfokus_configure_parser,
         run=postfokus_run,
+        mutates=lambda args: bool(args.duration),
     )

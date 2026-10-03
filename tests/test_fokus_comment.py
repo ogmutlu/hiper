@@ -20,7 +20,7 @@ class FokusCommentTest(unittest.TestCase):
                     "something", start, end, 300, comment="comment"
                 )
 
-            with open(path, "r", newline="", encoding="utf-8") as f:
+            with open(path, newline="", encoding="utf-8") as f:
                 rows = list(csv.DictReader(f))
 
         self.assertEqual(rows[0]["title"], "something")
@@ -50,7 +50,7 @@ class FokusCommentTest(unittest.TestCase):
             with mock.patch("hiper.storage.config.get_data_dir", return_value=tmp):
                 storage.save_session_csv("new", start, end, 300, comment="fresh")
 
-            with open(path, "r", newline="", encoding="utf-8") as f:
+            with open(path, newline="", encoding="utf-8") as f:
                 rows = list(csv.DictReader(f))
 
         self.assertEqual(rows[0]["comment"], "")

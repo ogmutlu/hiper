@@ -1,20 +1,19 @@
 import datetime as dt
-from typing import Optional
 
 from . import config, storage
-from .commands.set import DEFAULT_LANG
+from .defaults import DEFAULT_LANG
 
 
 def _load_lang_from_config() -> str:
     return config.get_config("lang", DEFAULT_LANG)
 
 
-_LANG: str = _load_lang_from_config()
+_LANG: str = DEFAULT_LANG
 
 
 def set_language(lang: str) -> None:
     global _LANG
-    _LANG = lang or DEFAULT_LANG  # type: ignore
+    _LANG = lang or DEFAULT_LANG
 
 
 def save_language(lang: str) -> None:
@@ -82,7 +81,7 @@ def saved_path_line(path: str) -> str:
     return templates.get(_LANG, templates["en"])
 
 
-def stats_header(title_filter: Optional[str] = None) -> str:
+def stats_header(title_filter: str | None = None) -> str:
     if title_filter:
         templates = {"en": f"Statistics {title_filter}"}
         return templates.get(_LANG, templates["en"])
@@ -106,14 +105,14 @@ def invalid_X(msg: str, X: str) -> str:
     templates = {
         "en": f"Invalid {X}: {msg}",
     }
-    return templates.get(_LANG, templates["en"]).format(msg=msg)
+    return templates.get(_LANG, templates["en"])
 
 
 def language_set(lang: str) -> str:
     templates = {
         "en": f"Language set to: {lang}",
     }
-    return templates.get(_LANG, templates["en"]).format(lang=lang)
+    return templates.get(_LANG, templates["en"])
 
 
 # To add translations:

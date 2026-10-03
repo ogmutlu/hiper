@@ -2,12 +2,4 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-PYTHON_BIN="${PYTHON_BIN:-python3}"
-
-# Ensure the package at $PROJECT_ROOT is importable from anywhere
-export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
-
-exec "$PYTHON_BIN" -m hiper "$@"
-
-
+exec uv run --project "$PROJECT_ROOT" --locked hiper "$@"

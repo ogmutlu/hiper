@@ -1,22 +1,22 @@
 import argparse
 import os
-from typing import List
 
 from .. import config, storage
 from .. import messages as msgs
+from ..defaults import (
+    DEFAULT_BAR_WIDTH,
+    DEFAULT_CLOCK,
+    DEFAULT_CLOCK_LENGTH,
+    DEFAULT_COUNTDOWN,
+    DEFAULT_ESTIMATE_BAR,
+    DEFAULT_LANG,
+    DEFAULT_NICK,
+    DEFAULT_PAUSE_END_MUSIC,
+    DEFAULT_PAUSE_LENGTH,
+    DEFAULT_TODAY_TIME,
+    DEFAULT_WORK_PER_DAY,
+)
 from . import Command
-
-DEFAULT_BAR_WIDTH = "42"
-DEFAULT_CLOCK = "bar"
-DEFAULT_CLOCK_LENGTH = "60m"
-DEFAULT_ESTIMATE_BAR = "true"
-DEFAULT_COUNTDOWN = "false"
-DEFAULT_LANG = "en"
-DEFAULT_NICK = "(not set)"
-DEFAULT_WORK_PER_DAY = "8h"
-DEFAULT_PAUSE_LENGTH = "15m"
-DEFAULT_PAUSE_END_MUSIC = ""
-DEFAULT_TODAY_TIME = "false"
 
 
 def set_configure_parser(p: argparse.ArgumentParser) -> None:
@@ -93,16 +93,17 @@ def set_run(args: argparse.Namespace) -> int:
         return 0
 
     # Set values
-    updated: List[str] = []
+    updated: list[str] = []
+    pending: dict[str, str] = {}
     if args.lang is not None:
         lang = args.lang.strip().lower()
-        config.set_config("lang", lang)
-        msgs.set_language(lang)
+        pending["lang"] = lang
+
         updated.append(f"lang={lang}")
 
     if args.nick is not None:
         nick = args.nick.strip()
-        config.set_config("nick", nick)
+        pending["nick"] = nick
         updated.append(f"nick={nick}")
 
     if args.savedir is not None:
@@ -110,28 +111,27 @@ def set_run(args: argparse.Namespace) -> int:
         if not os.path.isabs(savedir):
             print(f"Error: savedir must be an absolute path: {savedir}")
             return 1
-        if not os.path.exists(savedir):
-            try:
-                os.makedirs(savedir, exist_ok=True)
-            except Exception as e:
-                print(f"Error: cannot create directory {savedir}: {e}")
-                return 1
-        config.set_config("savedir", savedir)
+        if os.path.exists(savedir) and not os.path.isdir(savedir):
+            raise ValueError(f"savedir is not a directory: {savedir}")
+        pending["savedir"] = savedir
         updated.append(f"savedir={savedir}")
 
     if args.clock is not None:
         clock_parts = args.clock.strip().lower().split("=")
+        if len(clock_parts) > 2:
+            raise ValueError("clock must be digital, dots, or bar=DURATION")
         clock = clock_parts[0]
         if clock not in ("digital", "dots", "bar"):
             print(f"Error: invalid clock value: {clock}")
             return 1
-        config.set_config("clock", clock)
+        pending["clock"] = clock
         if len(clock_parts) > 1:
             length_str = clock_parts[1]
             try:
                 # Validate the duration format
-                storage.parse_duration(length_str)
-                config.set_config("clock_length", length_str)
+                if clock != "bar" or storage.parse_duration(length_str) <= 0:
+                    raise ValueError("bar clock duration must be greater than zero")
+                pending["clock_length"] = length_str
                 updated.append(f"clock_length={length_str}")
             except ValueError as e:
                 print(f"Error: invalid clock length '{length_str}': {e}")
@@ -142,7 +142,7 @@ def set_run(args: argparse.Namespace) -> int:
         if args.bar_width <= 0:
             print(f"Error: bar_width must be > 0: {args.bar_width}")
             return 1
-        config.set_config("bar_width", str(args.bar_width))
+        pending["bar_width"] = str(args.bar_width)
         updated.append(f"bar_width={args.bar_width}")
 
     if args.estimate_bar is not None:
@@ -150,7 +150,7 @@ def set_run(args: argparse.Namespace) -> int:
         if estimate_bar not in ("true", "false"):
             print(f"Error: estimate_bar must be 'true' or 'false': {estimate_bar}")
             return 1
-        config.set_config("estimate_bar", estimate_bar)
+        pending["estimate_bar"] = estimate_bar
         updated.append(f"estimate_bar={estimate_bar}")
 
     if args.countdown is not None:
@@ -158,7 +158,7 @@ def set_run(args: argparse.Namespace) -> int:
         if countdown not in ("true", "false"):
             print(f"Error: countdown must be 'true' or 'false': {countdown}")
             return 1
-        config.set_config("countdown", countdown)
+        pending["countdown"] = countdown
         updated.append(f"countdown={countdown}")
 
     if args.work_per_day is not None:
@@ -167,11 +167,11 @@ def set_run(args: argparse.Namespace) -> int:
             seconds = storage.parse_duration(work_per_day)
             if seconds <= 0:
                 raise ValueError("must be greater than zero")
-        except Exception as e:
+        except (OSError, ValueError) as e:
             print(f"Error: invalid work-per-day '{work_per_day}': {e}")
             return 1
         # Store original string so display matches user intent.
-        config.set_config("work_per_day", work_per_day)
+        pending["work_per_day"] = work_per_day
         updated.append(f"work_per_day={work_per_day}")
 
     if args.pause_length is not None:
@@ -180,11 +180,11 @@ def set_run(args: argparse.Namespace) -> int:
             seconds = storage.parse_duration(pause_length)
             if seconds <= 0:
                 raise ValueError("must be greater than zero")
-        except Exception as e:
+        except (OSError, ValueError) as e:
             print(f"Error: invalid pause-length '{pause_length}': {e}")
             return 1
         # Store original string so display matches user intent.
-        config.set_config("pause_length", pause_length)
+        pending["pause_length"] = pause_length
         updated.append(f"pause_length={pause_length}")
 
     if args.pause_end_music is not None:
@@ -192,7 +192,7 @@ def set_run(args: argparse.Namespace) -> int:
         # Allow empty string to disable music
         if pause_end_music:
             # Resolve path: if absolute, use as-is; if relative, join with data dir
-            data_dir = config.get_data_dir()
+            data_dir = pending.get("savedir", config.get_data_dir())
             if os.path.isabs(pause_end_music):
                 music_path = pause_end_music
             else:
@@ -208,7 +208,7 @@ def set_run(args: argparse.Namespace) -> int:
             ):
                 print(f"Error: music file must be a .mp3 file: {pause_end_music}")
                 return 1
-        config.set_config("pause_end_music", pause_end_music)
+        pending["pause_end_music"] = pause_end_music
         updated.append(
             f"pause_end_music={pause_end_music if pause_end_music else '(empty)'}"
         )
@@ -218,10 +218,15 @@ def set_run(args: argparse.Namespace) -> int:
         if today_time not in ("true", "false"):
             print(f"Error: today_time must be 'true' or 'false': {today_time}")
             return 1
-        config.set_config("today_time", today_time)
+        pending["today_time"] = today_time
         updated.append(f"today_time={today_time}")
 
     if updated:
+        if "savedir" in pending:
+            os.makedirs(pending["savedir"], exist_ok=True)
+        config.update_config(pending)
+        if "lang" in pending:
+            msgs.set_language(pending["lang"])
         print(f"Updated: {', '.join(updated)}")
     else:
         print("No settings specified. Use --show to see current settings.")

@@ -1,0 +1,13 @@
+"""Default settings shared by configuration and terminal commands."""
+
+DEFAULT_BAR_WIDTH = "42"
+DEFAULT_CLOCK = "bar"
+DEFAULT_CLOCK_LENGTH = "60m"
+DEFAULT_ESTIMATE_BAR = "true"
+DEFAULT_COUNTDOWN = "false"
+DEFAULT_LANG = "en"
+DEFAULT_NICK = "(not set)"
+DEFAULT_WORK_PER_DAY = "8h"
+DEFAULT_PAUSE_LENGTH = "15m"
+DEFAULT_PAUSE_END_MUSIC = ""
+DEFAULT_TODAY_TIME = "false"

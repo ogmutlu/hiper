@@ -1,8 +1,38 @@
-[tool.pyright]
-typeCheckingMode = "strict"
-include = ["hiper"]
-exclude = ["**/__pycache__", "**/node_modules"]
+[project]
+name = "hiper"
+version = "0.1.0"
+description = "A terminal companion for focus sessions, goals, reading, and habits"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=8,<9",
+    "wcwidth>=0.2.13",
+]
+
+[project.scripts]
+hiper = "hiper.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[dependency-groups]
+dev = ["ruff>=0.15", "ty>=0.0.84"]
 
 [tool.ruff]
+target-version = "py312"
 line-length = 88
-indent-width = 4
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "ANN"]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.src]
+include = ["hiper", "tests"]
+
+[tool.ty.rules]
+all = "error"

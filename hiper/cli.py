@@ -1,6 +1,6 @@
 import argparse
 import sys
-from typing import List, Optional
+from contextlib import nullcontext
 
 from .commands import COMMAND_REGISTRY, load_builtin_commands
 
@@ -31,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
     parser = build_parser()
     if not argv:
@@ -45,7 +45,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"  {name}")
         return 0
 
-    cmd_name: Optional[str] = getattr(args, "command", None)
+    command_value: object = getattr(args, "command", None)
+    cmd_name = command_value if isinstance(command_value, str) else None
     if not cmd_name:
         parser.print_help()
         return 0
@@ -55,7 +56,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Unknown command: {cmd_name}", file=sys.stderr)
         return 2
 
-    return command.run(args)
+    try:
+        from . import messages
+        from .config import get_config
+        from .defaults import DEFAULT_LANG
+
+        messages.set_language(get_config("lang", DEFAULT_LANG))
+        from .storage import data_transaction
+
+        with data_transaction() if command.mutates(args) else nullcontext():
+            return command.run(args)
+    except (OSError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        print("Interrupted.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

@@ -1,54 +1,186 @@
+"""CSV persistence with typed records, runtime paths, and atomic updates.
+
+Reads never create or rewrite files. Goals derive their worked time from sessions;
+only explicit mutations persist the resulting snapshot. Historical CSVs retain
+support for missing optional columns.
+"""
+
 import csv
 import datetime as dt
-import os
-from typing import Dict, List, Optional
+import hashlib
+import json
+import sys
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager
+from functools import wraps
+from pathlib import Path
+from uuid import uuid4
 
 from . import config
+from .files import atomic_text_writer
+from .locking import file_lock
+from .models import Book, Goal, Habit, LogEntry, Session
+from .timeutil import format_hms, local_datetime, parse_duration
+
+__all__ = [
+    "data_transaction",
+    "format_hms",
+    "parse_duration",
+    "get_data_dir",
+    "save_session_csv",
+    "load_sessions_csv",
+    "load_goals_csv",
+    "save_goals_csv",
+    "get_time_worked_for_title",
+    "get_time_worked_today",
+    "load_read_csv",
+    "save_read_csv",
+    "append_log_csv",
+    "load_log_csv",
+    "load_habits_csv",
+    "save_habits_csv",
+    "get_online_dir",
+    "append_online_fokus_line",
+    "get_other_online_fokus_status",
+]
+
+SESSION_FIELDS = (
+    "id",
+    "title",
+    "start",
+    "end",
+    "duration",
+    "duration_formatted",
+    "comment",
+)
+GOAL_FIELDS = (
+    "title",
+    "estimate_seconds",
+    "estimate_formatted",
+    "estimate_timestamp",
+    "deadline",
+    "time_worked_seconds",
+    "time_worked_formatted",
+    "start_by",
+)
+BOOK_FIELDS = ("title", "length", "current_page", "time_per_page_seconds")
+HABIT_FIELDS = ("name", "frequency", "created_at")
+LOG_FIELDS = ("message", "timestamp", "id")
+LOG_REQUIRED = ("message", "timestamp")
 
 
 def get_data_dir() -> str:
-    data_dir = config.get_data_dir()
-    os.makedirs(data_dir, exist_ok=True)
-    return data_dir
+    return config.get_data_dir()
 
 
-DATA_DIR = get_data_dir()
-
-SESSIONS_CSV = os.path.join(DATA_DIR, "sessions.csv")
-GOALS_CSV = os.path.join(DATA_DIR, "goals.csv")
-READ_CSV = os.path.join(DATA_DIR, "read.csv")
-LOG_CSV = os.path.join(DATA_DIR, "log.csv")
-HABITS_CSV = os.path.join(DATA_DIR, "habits.csv")
+def _path(name: str) -> Path:
+    return Path(get_data_dir()) / name
 
 
-def _ensure_csv_header(path: str) -> None:
-    expected_header = [
-        "title",
-        "start",
-        "end",
-        "duration",
-        "duration_formatted",
-        "comment",
-    ]
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(expected_header)  # duration in seconds
+def data_transaction() -> AbstractContextManager[None]:
+    return file_lock(_path(".hiper.lock"))
+
+
+def _locked[**P, T](function: Callable[P, T]) -> Callable[P, T]:
+    @wraps(function)
+    def wrapped(*args: P.args, **kwargs: P.kwargs) -> T:
+        with file_lock(_path(".hiper.lock")):
+            return function(*args, **kwargs)
+
+    return wrapped
+
+
+def _rows(name: str, required: Sequence[str]) -> Iterator[dict[str, str]]:
+    path = _path(name)
+    if not path.exists() or path.stat().st_size == 0:
         return
+    with path.open(newline="", encoding="utf-8") as stream:
+        reader = csv.DictReader(stream)
+        fields = reader.fieldnames or []
+        if not set(required).issubset(fields) or len(fields) != len(set(fields)):
+            raise ValueError(
+                f"{path}: invalid CSV header; required columns: {', '.join(required)}"
+            )
+        for row in reader:
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(f"{path}:{reader.line_num}: malformed CSV row")
+            yield {
+                key: value
+                for key, value in row.items()
+                if key is not None and value is not None
+            }
 
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None or "comment" in reader.fieldnames:
-            return
-        rows = list(reader)
 
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=expected_header)
+def _write(
+    name: str, fields: Sequence[str], rows: Sequence[Mapping[str, object]]
+) -> str:
+    path = _path(name)
+    with atomic_text_writer(path, newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
-        for row in rows:
-            writer.writerow({field: row.get(field, "") for field in expected_header})
+        writer.writerows(rows)
+    return str(path)
 
 
+def _identified_rows(name: str, required: Sequence[str]) -> list[dict[str, str]]:
+    rows = list(_rows(name, required))
+    occurrences: dict[str, int] = {}
+    identifiers: set[str] = set()
+    for row in rows:
+        digest = hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in row.items() if key != "id"},
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        occurrence = occurrences.get(digest, 0)
+        occurrences[digest] = occurrence + 1
+        identifier = row.get("id") or f"legacy-{digest}-{occurrence}"
+        if identifier in identifiers:
+            raise ValueError(f"{name}: duplicate record ID")
+        identifiers.add(identifier)
+        row["id"] = identifier
+    return rows
+
+
+def _preserved_fields(name: str, required: Sequence[str]) -> list[str]:
+    path = _path(name)
+    fields = list(required)
+    if path.exists() and path.stat().st_size:
+        with path.open(newline="", encoding="utf-8") as stream:
+            fields = list(csv.DictReader(stream).fieldnames or required)
+    return fields + [field for field in required if field not in fields]
+
+
+def _integer(row: Mapping[str, str], field: str) -> int:
+    value = int(row.get(field, "") or 0)
+    if value < 0:
+        raise ValueError(f"{field} must be nonnegative")
+    return value
+
+
+def load_sessions_csv() -> list[Session]:
+    sessions: list[Session] = []
+    for row in _identified_rows("sessions.csv", ("title", "start", "end", "duration")):
+        start = local_datetime(row["start"])
+        end = local_datetime(row["end"])
+        duration = _integer(row, "duration")
+        if end < start:
+            raise ValueError("sessions.csv: end precedes start")
+        sessions.append(
+            Session(
+                id=row["id"],
+                title=row["title"],
+                start=start,
+                end=end,
+                duration=duration,
+                comment=row.get("comment", ""),
+            )
+        )
+    return sessions
+
+
+@_locked
 def save_session_csv(
     title: str,
     start: dt.datetime,
@@ -56,626 +188,316 @@ def save_session_csv(
     duration_seconds: int,
     comment: str = "",
 ) -> str:
-    data_dir = get_data_dir()
-    sessions_csv = os.path.join(data_dir, "sessions.csv")
-    _ensure_csv_header(sessions_csv)
-    with open(sessions_csv, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                title or "",
-                start.isoformat(),
-                end.isoformat(),
-                str(duration_seconds),
-                format_hms(duration_seconds),
-                comment or "",
-            ]
+    start = local_datetime(start.isoformat())
+    end = local_datetime(end.isoformat())
+    if duration_seconds < 0 or end < start:
+        raise ValueError(
+            "session must have a nonnegative duration and end on or after start"
         )
-
-    # Update goals.csv to ensure this title has an entry and time_worked is updated
-    # This ensures goals.csv stays in sync with sessions.csv
+    # Preserve additional user columns and accept reordered headers when appending.
+    path = _path("sessions.csv")
+    rows = _identified_rows("sessions.csv", ("title", "start", "end", "duration"))
+    fields = list(SESSION_FIELDS)
+    if path.exists() and path.stat().st_size:
+        with path.open(newline="", encoding="utf-8") as stream:
+            fields = list(csv.DictReader(stream).fieldnames or SESSION_FIELDS)
+        if "comment" not in fields:
+            fields.append("comment")
+    rows.append(
+        {
+            "id": uuid4().hex,
+            "title": title.strip(),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "duration": str(duration_seconds),
+            "duration_formatted": format_hms(duration_seconds),
+            "comment": comment,
+        }
+    )
+    # Old hand-written CSVs may lack the derived duration column.
+    for field in SESSION_FIELDS:
+        if field not in fields:
+            fields.append(field)
+    result = _write("sessions.csv", fields, rows)
     try:
-        load_goals_csv()
-    except Exception as e:
-        # If updating goals fails, don't fail the session save
-        print(f"Error updating goals.csv: {e}")
-
-    return sessions_csv
-
-
-def format_hms(seconds: int) -> str:
-    minutes, secs = divmod(int(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours:02d}h{minutes:02d}m{secs:02d}s"
-    return f"{minutes:02d}m{secs:02d}s"
-
-
-def parse_duration(s: str) -> int:
-    s = s.strip().lower()
-    if not s:
-        raise ValueError("empty duration")
-    total = 0
-    num = ""
-    i = 0
-    while i < len(s):
-        ch = s[i]
-        if ch.isdigit():
-            num += ch
-            i += 1
-            continue
-        if ch in ("h", "m", "s"):
-            if not num:
-                raise ValueError("missing number before unit")
-            val = int(num)
-            if ch == "h":
-                total += val * 3600
-            elif ch == "m":
-                total += val * 60
-            else:
-                total += val
-            num = ""
-            i += 1
-            continue
-        raise ValueError(f"unexpected character '{ch}' in duration")
-    if num:
-        # trailing number with no unit -> minutes
-        total += int(num) * 60
-    if total < 0:
-        raise ValueError("duration must be >= 0")
-    return total
-
-
-def load_sessions_csv() -> List[Dict[str, object]]:
-    data_dir = get_data_dir()
-    sessions_csv = os.path.join(data_dir, "sessions.csv")
-    if not os.path.exists(sessions_csv) or os.path.getsize(sessions_csv) == 0:
-        return []
-    rows: List[Dict[str, object]] = []
-    with open(sessions_csv, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            title = row.get("title", "")
-            start = (
-                dt.datetime.fromisoformat(row["start"]) if row.get("start") else None
-            )
-            end = dt.datetime.fromisoformat(row["end"]) if row.get("end") else None
-            duration = int(row.get("duration", "0") or 0)
-            comment = row.get("comment", "")
-            if start is None or end is None:
-                continue
-            rows.append(
-                {
-                    "title": title or "",
-                    "start": start,
-                    "end": end,
-                    "duration": duration,
-                    "comment": comment or "",
-                }
-            )
-    return rows
-
-
-def _ensure_goals_csv_header(path: str) -> None:
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "title",
-                    "estimate_seconds",
-                    "estimate_formatted",
-                    "estimate_timestamp",
-                    "deadline",
-                    "time_worked_seconds",
-                    "time_worked_formatted",
-                    "start_by",
-                ]
-            )
-
-
-def load_goals_csv() -> List[Dict[str, object]]:
-    """Load goals from goals.csv, ensuring all session titles have entries."""
-    data_dir = get_data_dir()
-    goals_csv = os.path.join(data_dir, "goals.csv")
-    _ensure_goals_csv_header(goals_csv)
-
-    # Load existing goals
-    existing_goals: Dict[str, Dict[str, object]] = {}
-    if os.path.exists(goals_csv) and os.path.getsize(goals_csv) > 0:
-        with open(goals_csv, "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                title = row.get("title", "").strip()
-                if not title:
-                    continue
-
-                estimate_str = row.get("estimate_seconds", "").strip()
-                estimate_seconds = int(estimate_str) if estimate_str else 0
-
-                deadline_str = row.get("deadline", "").strip()
-                deadline = (
-                    dt.datetime.strptime(deadline_str, "%Y-%m-%d").date()
-                    if deadline_str
-                    else None
-                )
-
-                estimate_timestamp_str = row.get("estimate_timestamp", "").strip()
-                estimate_timestamp = (
-                    dt.datetime.fromisoformat(estimate_timestamp_str)
-                    if estimate_timestamp_str
-                    else None
-                )
-
-                time_worked_str = row.get("time_worked_seconds", "").strip()
-                time_worked_seconds = int(time_worked_str) if time_worked_str else 0
-
-                start_by_str = row.get("start_by", "").strip()
-                start_by = (
-                    dt.datetime.strptime(start_by_str, "%Y-%m-%d").date()
-                    if start_by_str
-                    else None
-                )
-
-                # Compute formatted values if not present (for backward compatibility)
-                estimate_formatted = row.get("estimate_formatted", "").strip()
-                if not estimate_formatted and estimate_seconds > 0:
-                    estimate_formatted = format_hms(estimate_seconds)
-
-                time_worked_formatted = row.get("time_worked_formatted", "").strip()
-                if not time_worked_formatted and time_worked_seconds > 0:
-                    time_worked_formatted = format_hms(time_worked_seconds)
-
-                existing_goals[title] = {
-                    "title": title,
-                    "estimate_seconds": estimate_seconds,
-                    "estimate_formatted": estimate_formatted,
-                    "estimate_timestamp": estimate_timestamp,
-                    "deadline": deadline,
-                    "time_worked_seconds": time_worked_seconds,
-                    "time_worked_formatted": time_worked_formatted,
-                    "start_by": start_by,
-                }
-
-    # Get all unique titles from sessions.csv
-    sessions = load_sessions_csv()
-    session_titles: set[str] = set()
-    for session in sessions:
-        title_obj = session.get("title")
-        if isinstance(title_obj, str):
-            title = title_obj.strip()
-            if title:
-                session_titles.add(title)
-
-    # Ensure all session titles have goal entries
-    new_entries_created = False
-    for title in session_titles:
-        if title not in existing_goals:
-            # Create entry with blank estimate/deadline/start_by
-            existing_goals[title] = {
-                "title": title,
-                "estimate_seconds": 0,
-                "estimate_formatted": "",
-                "estimate_timestamp": None,
-                "deadline": None,
-                "time_worked_seconds": 0,
-                "time_worked_formatted": "",
-                "start_by": None,
-            }
-            new_entries_created = True
-
-    # Update time_worked for all goals
-    time_updated = False
-    for goal in existing_goals.values():
-        goal_title = goal.get("title")
-        if isinstance(goal_title, str):
-            # Get time worked after estimate timestamp if it exists
-            estimate_timestamp = goal.get("estimate_timestamp")
-            if isinstance(estimate_timestamp, dt.datetime):
-                new_time = get_time_worked_for_title(
-                    goal_title, after_timestamp=estimate_timestamp
-                )
-            else:
-                # If no timestamp, use all time worked (backward compatibility)
-                new_time = get_time_worked_for_title(goal_title)
-            if goal.get("time_worked_seconds", 0) != new_time:
-                goal["time_worked_seconds"] = new_time
-                goal["time_worked_formatted"] = (
-                    format_hms(new_time) if new_time > 0 else ""
-                )
-                time_updated = True
-            elif not goal.get("time_worked_formatted"):
-                # Ensure formatted value exists
-                goal["time_worked_formatted"] = (
-                    format_hms(new_time) if new_time > 0 else ""
-                )
-
-        # Ensure estimate_formatted exists
-        estimate_sec = goal.get("estimate_seconds", 0)
-        if isinstance(estimate_sec, int) and estimate_sec > 0:
-            if not goal.get("estimate_formatted"):
-                goal["estimate_formatted"] = format_hms(estimate_sec)
-
-    # Save if new entries were created or time_worked was updated
-    if new_entries_created or time_updated:
-        save_goals_csv(list(existing_goals.values()))
-
-    return list(existing_goals.values())
-
-
-def save_goals_csv(goals: List[Dict[str, object]]) -> str:
-    """Save goals to goals.csv."""
-    data_dir = get_data_dir()
-    goals_csv = os.path.join(data_dir, "goals.csv")
-    _ensure_goals_csv_header(goals_csv)
-    with open(goals_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "title",
-                "estimate_seconds",
-                "estimate_formatted",
-                "estimate_timestamp",
-                "deadline",
-                "time_worked_seconds",
-                "time_worked_formatted",
-                "start_by",
-            ]
+        save_goals_csv(load_goals_csv())
+    except (OSError, ValueError) as exc:
+        print(
+            f"Warning: session saved, but goals could not be refreshed: {exc}",
+            file=sys.stderr,
         )
-        for goal in goals:
-            estimate_seconds = goal.get("estimate_seconds", 0)
-            estimate_formatted = goal.get("estimate_formatted", "")
-            if (
-                not estimate_formatted
-                and isinstance(estimate_seconds, int)
-                and estimate_seconds > 0
-            ):
-                estimate_formatted = format_hms(estimate_seconds)
-
-            estimate_timestamp = goal.get("estimate_timestamp")
-
-            deadline = goal.get("deadline")
-            time_worked_seconds = goal.get("time_worked_seconds", 0)
-            time_worked_formatted = goal.get("time_worked_formatted", "")
-            if (
-                not time_worked_formatted
-                and isinstance(time_worked_seconds, int)
-                and time_worked_seconds > 0
-            ):
-                time_worked_formatted = format_hms(time_worked_seconds)
-
-            start_by = goal.get("start_by")
-
-            writer.writerow(
-                [
-                    goal["title"],
-                    str(estimate_seconds) if estimate_seconds else "",
-                    estimate_formatted,
-                    estimate_timestamp.isoformat()
-                    if isinstance(estimate_timestamp, dt.datetime)
-                    else "",
-                    deadline.strftime("%Y-%m-%d")
-                    if isinstance(deadline, dt.date)
-                    else "",
-                    str(time_worked_seconds) if time_worked_seconds else "",
-                    time_worked_formatted,
-                    start_by.strftime("%Y-%m-%d")
-                    if isinstance(start_by, dt.date)
-                    else "",
-                ]
-            )
-    return goals_csv
+    return result
 
 
 def get_time_worked_for_title(
-    title: str, after_timestamp: Optional[dt.datetime] = None
+    title: str, after_timestamp: dt.datetime | None = None
 ) -> int:
-    """Get total time worked for a given title from sessions.csv.
-    If after_timestamp is provided, only counts sessions that started after that timestamp.
-    """
-    rows = load_sessions_csv()
-    total = 0
-    title_stripped = title.strip()
-    for row in rows:
-        row_title = row.get("title")
-        if isinstance(row_title, str) and row_title.strip() == title_stripped:
-            # Check if session started after timestamp
-            if after_timestamp:
-                start = row.get("start")
-                if not isinstance(start, dt.datetime):
-                    continue
-                if start < after_timestamp:
-                    continue
+    return _worked(load_sessions_csv(), title.strip(), after_timestamp)
 
-            duration = row.get("duration", 0)
-            if isinstance(duration, int):
-                total += duration
-            elif isinstance(duration, str):
-                try:
-                    total += int(duration)
-                except (ValueError, TypeError):
-                    pass
-    return total
+
+def _worked(sessions: Sequence[Session], title: str, after: dt.datetime | None) -> int:
+    if after is not None:
+        after = local_datetime(after.isoformat())
+    return sum(
+        row["duration"]
+        for row in sessions
+        if row["title"].strip() == title and (after is None or row["start"] >= after)
+    )
 
 
 def get_time_worked_today() -> int:
-    """Get total time worked today from sessions.csv."""
-    rows = load_sessions_csv()
-    total = 0
     today = dt.date.today()
-    for row in rows:
-        start = row.get("start")
-        if not isinstance(start, dt.datetime):
+    return sum(
+        row["duration"] for row in load_sessions_csv() if row["start"].date() == today
+    )
+
+
+def load_goals_csv() -> list[Goal]:
+    goals: dict[str, Goal] = {}
+    deleted: set[str] = set()
+    for row in _rows("goals.csv", ("title", "estimate_seconds")):
+        title = row["title"].strip()
+        if row.get("deleted") == "1":
+            deleted.add(title)
             continue
-        if start.date() != today:
-            continue
-
-        duration = row.get("duration", 0)
-        if isinstance(duration, int):
-            total += duration
-        elif isinstance(duration, str):
-            try:
-                total += int(duration)
-            except (ValueError, TypeError):
-                pass
-    return total
-
-
-def _ensure_read_csv_header(path: str) -> None:
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                ["title", "length", "current_page", "time_per_page_seconds"]
+        if not title:
+            raise ValueError("goals.csv: title cannot be empty")
+        if title in goals:
+            raise ValueError(f"goals.csv: duplicate title {title!r}")
+        estimate = _integer(row, "estimate_seconds")
+        timestamp = row.get("estimate_timestamp", "")
+        deadline = row.get("deadline", "")
+        start_by = row.get("start_by", "")
+        goals[title] = Goal(
+            title=title,
+            estimate_seconds=estimate,
+            estimate_formatted=format_hms(estimate) if estimate else "",
+            estimate_timestamp=local_datetime(timestamp) if timestamp else None,
+            deadline=dt.date.fromisoformat(deadline) if deadline else None,
+            time_worked_seconds=0,
+            time_worked_formatted="",
+            start_by=dt.date.fromisoformat(start_by) if start_by else None,
+        )
+    sessions = load_sessions_csv()
+    for title in sorted({row["title"].strip() for row in sessions} - {""}):
+        if title not in goals and title not in deleted:
+            goals[title] = Goal(
+                title=title,
+                estimate_seconds=0,
+                estimate_formatted="",
+                estimate_timestamp=None,
+                deadline=None,
+                time_worked_seconds=0,
+                time_worked_formatted="",
+                start_by=None,
             )
+    for goal in goals.values():
+        worked = _worked(sessions, goal["title"], goal["estimate_timestamp"])
+        goal["time_worked_seconds"] = worked
+        goal["time_worked_formatted"] = format_hms(worked) if worked else ""
+    return list(goals.values())
 
 
-def load_read_csv() -> List[Dict[str, object]]:
-    """Load reading list from read.csv."""
-    data_dir = get_data_dir()
-    read_csv = os.path.join(data_dir, "read.csv")
-    _ensure_read_csv_header(read_csv)
-
-    rows: List[Dict[str, object]] = []
-    if not os.path.exists(read_csv) or os.path.getsize(read_csv) == 0:
-        return rows
-
-    with open(read_csv, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            title = row.get("title", "").strip()
-            if not title:
-                continue
-
-            length_str = row.get("length", "").strip()
-            length = int(length_str) if length_str else 0
-
-            current_page_str = row.get("current_page", "").strip()
-            current_page = int(current_page_str) if current_page_str else 0
-
-            time_per_page_str = row.get("time_per_page_seconds", "").strip()
-            time_per_page_seconds = int(time_per_page_str) if time_per_page_str else 0
-
+@_locked
+def save_goals_csv(goals: list[Goal]) -> str:
+    rows: list[dict[str, object]] = []
+    for goal in goals:
+        estimate = goal["estimate_seconds"]
+        worked = goal["time_worked_seconds"]
+        rows.append(
+            {
+                "title": goal["title"],
+                "estimate_seconds": estimate,
+                "estimate_formatted": format_hms(estimate) if estimate else "",
+                "estimate_timestamp": goal["estimate_timestamp"].isoformat()
+                if goal["estimate_timestamp"]
+                else "",
+                "deadline": goal["deadline"].isoformat() if goal["deadline"] else "",
+                "time_worked_seconds": worked,
+                "time_worked_formatted": format_hms(worked) if worked else "",
+                "start_by": goal["start_by"].isoformat() if goal["start_by"] else "",
+            }
+        )
+    active = {goal["title"] for goal in goals}
+    for old in _rows("goals.csv", ("title", "estimate_seconds")):
+        if old.get("deleted") == "1" and old["title"] not in active:
             rows.append(
-                {
-                    "title": title,
-                    "length": length,
-                    "current_page": current_page,
-                    "time_per_page_seconds": time_per_page_seconds,
-                }
+                {field: old.get(field, "") for field in (*GOAL_FIELDS, "deleted")}
             )
+    return _write("goals.csv", (*GOAL_FIELDS, "deleted"), rows)
 
-    return rows
+
+def load_read_csv() -> list[Book]:
+    books: list[Book] = []
+    for row in _rows("read.csv", ("title", "length", "current_page")):
+        book = Book(
+            title=row["title"].strip(),
+            length=_integer(row, "length"),
+            current_page=_integer(row, "current_page"),
+            time_per_page_seconds=_integer(row, "time_per_page_seconds"),
+        )
+        if (
+            not book["title"]
+            or book["length"] <= 0
+            or book["current_page"] > book["length"]
+        ):
+            raise ValueError("read.csv: invalid book title, length, or current page")
+        if any(item["title"] == book["title"] for item in books):
+            raise ValueError(f"read.csv: duplicate title {book['title']!r}")
+        books.append(book)
+    return books
 
 
-def save_read_csv(reads: List[Dict[str, object]]) -> str:
-    """Save reading list to read.csv."""
-    data_dir = get_data_dir()
-    read_csv = os.path.join(data_dir, "read.csv")
-    _ensure_read_csv_header(read_csv)
+@_locked
+def save_read_csv(reads: list[Book]) -> str:
+    return _write("read.csv", BOOK_FIELDS, reads)
 
-    with open(read_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["title", "length", "current_page", "time_per_page_seconds"])
-        for read_item in reads:
-            title = read_item.get("title", "")
-            length = read_item.get("length", 0)
-            current_page = read_item.get("current_page", 0)
-            time_per_page_seconds = read_item.get("time_per_page_seconds", 0)
 
-            writer.writerow(
-                [
-                    title,
-                    str(length) if length else "",
-                    str(current_page) if current_page else "",
-                    str(time_per_page_seconds) if time_per_page_seconds else "",
-                ]
+@_locked
+def append_log_csv(message: str, when: dt.datetime | None = None) -> str:
+    rows = _identified_rows("log.csv", LOG_REQUIRED)
+    rows.append(
+        {
+            "id": uuid4().hex,
+            "message": message,
+            "timestamp": (when or dt.datetime.now()).isoformat(),
+        }
+    )
+    return _write("log.csv", _preserved_fields("log.csv", LOG_FIELDS), rows)
+
+
+def load_log_csv() -> list[LogEntry]:
+    return [
+        LogEntry(
+            id=row["id"],
+            message=row["message"],
+            timestamp=local_datetime(row["timestamp"]) if row["timestamp"] else None,
+        )
+        for row in _identified_rows("log.csv", LOG_REQUIRED)
+    ]
+
+
+def load_habits_csv() -> list[Habit]:
+    habits: list[Habit] = []
+    path = _path("habits.csv")
+    # Missing historical timestamps use file modification time, never today's date.
+    fallback = (
+        dt.datetime.fromtimestamp(path.stat().st_mtime)
+        if path.exists()
+        else dt.datetime.now()
+    )
+    for row in _rows("habits.csv", ("name", "frequency")):
+        name = row["name"].strip()
+        if not name:
+            raise ValueError("habits.csv: name cannot be empty")
+        timestamp = row.get("created_at", "")
+        habits.append(
+            Habit(
+                name=name,
+                frequency=row["frequency"],
+                created_at=local_datetime(timestamp) if timestamp else fallback,
             )
-
-    return read_csv
-
-
-def _ensure_log_csv_header(path: str) -> None:
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["message", "timestamp"])
+        )
+    return habits
 
 
-def append_log_csv(message: str, when: Optional[dt.datetime] = None) -> str:
-    """Append a message with timestamp to log.csv."""
-    data_dir = get_data_dir()
-    log_csv = os.path.join(data_dir, "log.csv")
-    _ensure_log_csv_header(log_csv)
-    timestamp = when or dt.datetime.now()
-    with open(log_csv, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([message, timestamp.isoformat()])
-    return log_csv
-
-
-def load_log_csv() -> List[Dict[str, object]]:
-    """Load logs as a list of dicts."""
-    data_dir = get_data_dir()
-    log_csv = os.path.join(data_dir, "log.csv")
-    if not os.path.exists(log_csv) or os.path.getsize(log_csv) == 0:
-        return []
-
-    rows: List[Dict[str, object]] = []
-    with open(log_csv, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            message = row.get("message", "")
-            ts_str = row.get("timestamp", "")
-            try:
-                ts = dt.datetime.fromisoformat(ts_str) if ts_str else None
-            except ValueError:
-                ts = None
-            rows.append({"message": message, "timestamp": ts})
-    return rows
-
-
-def _ensure_habits_csv_header(path: str) -> None:
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["name", "frequency", "created_at"])
-
-
-def load_habits_csv() -> List[Dict[str, object]]:
-    """Load habits from habits.csv."""
-    data_dir = get_data_dir()
-    habits_csv = os.path.join(data_dir, "habits.csv")
-    _ensure_habits_csv_header(habits_csv)
-
-    rows: List[Dict[str, object]] = []
-    if not os.path.exists(habits_csv) or os.path.getsize(habits_csv) == 0:
-        return rows
-
-    with open(habits_csv, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            name = row.get("name", "").strip()
-            frequency = row.get("frequency", "").strip()
-            if not name:
-                continue
-
-            created_at_str = row.get("created_at", "").strip()
-            created_at = None
-            if created_at_str:
-                try:
-                    created_at = dt.datetime.fromisoformat(created_at_str)
-                except ValueError:
-                    # If parsing fails, use current time as fallback
-                    raise ValueError(f"Invalid created_at: {created_at_str}")
-                    created_at = dt.datetime.now()
-            else:
-                # For backward compatibility, use current time if missing
-                created_at = dt.datetime.now()
-
-            rows.append(
-                {"name": name, "frequency": frequency, "created_at": created_at}
-            )
-    return rows
-
-
-def save_habits_csv(habits: List[Dict[str, object]]) -> str:
-    """Save habits to habits.csv."""
-    data_dir = get_data_dir()
-    habits_csv = os.path.join(data_dir, "habits.csv")
-    _ensure_habits_csv_header(habits_csv)
-
-    with open(habits_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["name", "frequency", "created_at"])
-        for habit in habits:
-            name = habit.get("name", "")
-            frequency = habit.get("frequency", "")
-            created_at = habit.get("created_at")
-            if isinstance(created_at, dt.datetime):
-                created_at_str = created_at.isoformat()
-            else:
-                # Fallback to current time if not a datetime
-                created_at_str = dt.datetime.now().isoformat()
-            writer.writerow([name, frequency, created_at_str])
-    return habits_csv
-
-
-# --- Online fokus (data_dir/online/NICKNAME.txt) ---
+@_locked
+def save_habits_csv(habits: list[Habit]) -> str:
+    return _write(
+        "habits.csv",
+        HABIT_FIELDS,
+        [
+            {
+                "name": h["name"],
+                "frequency": h["frequency"],
+                "created_at": h["created_at"].isoformat(),
+            }
+            for h in habits
+        ],
+    )
 
 
 def get_online_dir() -> str:
-    """Return data_dir/online, creating it if needed."""
-    data_dir = get_data_dir()
-    online_dir = os.path.join(data_dir, "online")
-    os.makedirs(online_dir, exist_ok=True)
-    return online_dir
+    return str(_path("online"))
 
 
 def _sanitize_nickname_for_filename(nickname: str) -> str:
-    """Return a safe filename base from nickname (no extension)."""
-    if not nickname or not nickname.strip():
-        return "unknown"
-    s = nickname.strip()
-    unsafe = '/\\:*?"<>|'
-    for c in unsafe:
-        s = s.replace(c, "_")
-    return s or "unknown"
+    value = nickname.strip()
+    for character in '/\\:*?"<>|\r\n':
+        value = value.replace(character, "_")
+    return value or "unknown"
 
 
+@_locked
 def append_online_fokus_line(nickname: str, line: str) -> None:
-    """Append a line to data_dir/online/NICKNAME.txt."""
-    online_dir = get_online_dir()
-    base = _sanitize_nickname_for_filename(nickname)
-    path = os.path.join(online_dir, base + ".txt")
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    path = Path(get_online_dir()) / (_sanitize_nickname_for_filename(nickname) + ".txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(line.replace("\n", " ").replace("\r", " ") + "\n")
 
 
 def get_other_online_fokus_status(
     current_nickname: str,
-) -> Optional[tuple[str, str, bool]]:
-    """If another user has an online fokus file, return (nickname, title, is_active).
-
-    is_active True => "NICKNAME is fokusing on TITLE right now"
-    is_active False => "NICKNAME has fokused on TITLE last time"
-    title may be empty. Returns None if no other user file or no fokus line found.
-    """
-    online_dir = get_online_dir()
-    current_base = _sanitize_nickname_for_filename(current_nickname)
-    if not os.path.isdir(online_dir):
+) -> tuple[str, str, bool] | None:
+    directory = Path(get_online_dir())
+    if not directory.is_dir():
         return None
-
-    for name in os.listdir(online_dir):
-        if not name.endswith(".txt"):
-            continue
-        base = name[:-4]
-        if base == current_base:
-            continue
-        path = os.path.join(online_dir, name)
-        if not os.path.isfile(path):
+    current = _sanitize_nickname_for_filename(current_nickname)
+    for path in sorted(directory.glob("*.txt")):
+        if path.stem == current or not path.is_file():
             continue
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                lines = [ln.rstrip("\n\r") for ln in f.readlines()]
+            lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
-        rev = list(reversed(lines))
-        if not rev:
-            continue
-        last_line = rev[0].strip() if rev else ""
-        title = ""
-        for ln in rev:
-            s = ln.strip()
-            if s.startswith("fokus:"):
-                title = s[6:].strip()
-                break
-        if last_line == "end":
-            return (base, title, False)
-        # Last line is not "end" -> currently fokusing
-        for ln in rev:
-            s = ln.strip()
-            if s.startswith("fokus:"):
-                title = s[6:].strip()
-                return (base, title, True)
+        lines = [line.strip() for line in lines if line.strip()]
+        for line in reversed(lines):
+            if line.startswith("fokus:"):
+                return path.stem, line[6:].strip(), lines[-1].startswith("fokus:")
     return None
+
+
+@_locked
+def delete_record(kind: str, key: str) -> str:
+    """Remove exactly one selected record, preserving unrelated history.
+
+    Goal tombstones suppress implicit goals derived from historical sessions.
+    Explicitly saving a new goal with the same title restores it.
+    """
+    if kind == "goal":
+        goals = load_goals_csv()
+        goal = next((goal for goal in goals if goal["title"] == key), None)
+        if goal is None:
+            raise ValueError(f"Goal not found: {key}")
+        # Persist implicit goals before marking this one deleted.
+        save_goals_csv(goals)
+        rows = list(_rows("goals.csv", ("title", "estimate_seconds")))
+        for row in rows:
+            if row["title"] == key:
+                row["deleted"] = "1"
+        _write(
+            "goals.csv", _preserved_fields("goals.csv", (*GOAL_FIELDS, "deleted")), rows
+        )
+    else:
+        specifications = {
+            "book": ("read.csv", "title", BOOK_FIELDS),
+            "habit": ("habits.csv", "name", ("name", "frequency")),
+            "session": ("sessions.csv", "id", ("title", "start", "end", "duration")),
+            "log": ("log.csv", "id", LOG_REQUIRED),
+        }
+        if kind not in specifications:
+            raise ValueError(f"Unknown record type: {kind}")
+        name, field, required = specifications[kind]
+        rows = (
+            _identified_rows(name, required)
+            if field == "id"
+            else list(_rows(name, required))
+        )
+        matches = [row for row in rows if row[field].strip() == key]
+        if len(matches) != 1:
+            raise ValueError(f"{kind.capitalize()} not found or ambiguous: {key}")
+        fields = _preserved_fields(
+            name, (*required, "id") if field == "id" else required
+        )
+        _write(name, fields, [row for row in rows if row is not matches[0]])
+    return f"Deleted {kind}: {key}"

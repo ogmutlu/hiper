@@ -31,7 +31,7 @@ def kant_run(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(file_path, encoding="utf-8") as f:
             lines = [line.strip() for line in f if line.strip()]
 
         if not lines:
@@ -43,7 +43,7 @@ def kant_run(args: argparse.Namespace) -> int:
         print(random_line)
         return 0
 
-    except Exception as e:
+    except (OSError, UnicodeError) as e:
         print(f"Error reading {filename}: {e}")
         return 1
 

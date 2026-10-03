@@ -14,7 +14,7 @@ def backup_configure_parser(p: argparse.ArgumentParser) -> None:
 
 def _build_backup_path(data_dir: str) -> str:
     """Return backup path alongside data_dir with timestamp suffix."""
-    timestamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+    timestamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S%f")
     return os.path.join(data_dir, f"backup_{timestamp}")
 
 
@@ -36,7 +36,7 @@ def backup_run(_args: argparse.Namespace) -> int:
     except FileExistsError:
         print(f"Error: backup path already exists: {backup_path}")
         return 1
-    except Exception as e:  # pragma: no cover - unexpected errors
+    except OSError as e:  # pragma: no cover - unexpected errors
         print(f"Error: failed to create backup: {e}")
         return 1
 
@@ -48,8 +48,9 @@ def get_command() -> Command:
     return Command(
         name="backup",
         help="Backup hiper data directory.",
-        description="Copy the hiper data directory to a sibling folder with a "
+        description="Copy the hiper data directory to a backup subdirectory with a "
         "timestamp suffix.",
         configure_parser=backup_configure_parser,
         run=backup_run,
+        mutates=lambda args: True,
     )

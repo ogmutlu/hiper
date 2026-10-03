@@ -2,22 +2,24 @@ import io
 import os
 import unittest
 from contextlib import redirect_stdout
+from typing import override
 from unittest import mock
 
-from hiper.commands import fokus
+from hiper import rendering
 
 
 class FokusRenderTest(unittest.TestCase):
+    @override
     def tearDown(self) -> None:
-        fokus._last_render_rows = 0
+        rendering._last_render_rows = 0
 
     def test_tick_render_moves_by_wrapped_screen_rows(self) -> None:
         terminal_size = os.terminal_size((10, 24))
         title = "abcdefghij"
 
         with (
-            mock.patch("hiper.commands.fokus.shutil.get_terminal_size") as size,
-            mock.patch("hiper.commands.fokus.config.get_config") as get_config,
+            mock.patch("hiper.rendering.shutil.get_terminal_size") as size,
+            mock.patch("hiper.rendering.config.get_config") as get_config,
             redirect_stdout(io.StringIO()) as output,
         ):
             size.return_value = terminal_size
@@ -28,13 +30,13 @@ class FokusRenderTest(unittest.TestCase):
                 "today_time": "false",
             }.get(key, default)
 
-            fokus._tick_render(
+            rendering._tick_render(
                 0,
                 session_title=title,
                 is_first_render=True,
                 context_time_before=0,
             )
-            fokus._tick_render(
+            rendering._tick_render(
                 1,
                 session_title=title,
                 context_time_before=0,

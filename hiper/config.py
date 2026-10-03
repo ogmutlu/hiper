@@ -1,51 +1,60 @@
+"""Load validated settings at runtime without import-time filesystem access."""
+
 import json
 import os
-from typing import Dict
+from pathlib import Path
 
-_DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "hiper")
-_CONFIG_FILE = os.path.join(_DEFAULT_DATA_DIR, "config.json")
-_CONFIG_CACHE: Dict[str, str] | None = None
-
-
-def _load_config() -> Dict[str, str]:
-    global _CONFIG_CACHE
-    if _CONFIG_CACHE is not None:
-        return _CONFIG_CACHE
-
-    cache: Dict[str, str] = {}
-    if os.path.exists(_CONFIG_FILE):
-        try:
-            with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-        except Exception as e:
-            print(f"Error: cannot load config file {_CONFIG_FILE}: {e}")
-
-    _CONFIG_CACHE = cache  # type: ignore
-    return cache
+from .files import atomic_text_writer
+from .locking import file_lock
 
 
-def _save_config(cfg: Dict[str, str]) -> None:
-    global _CONFIG_CACHE
-    os.makedirs(_DEFAULT_DATA_DIR, exist_ok=True)
+def config_file() -> Path:
+    """Keep the historical location; allow isolated CLI runs through an override."""
+    override = os.environ.get("HIPER_CONFIG_FILE")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".local" / "share" / "hiper" / "config.json"
 
-    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-    _CONFIG_CACHE = cfg  # type: ignore
+
+def _load_config() -> dict[str, str]:
+    path = config_file()
+    if not path.exists():
+        return {}
+    with path.open(encoding="utf-8") as stream:
+        value: object = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: configuration must be an object of string settings")
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not isinstance(item, str):
+            raise ValueError(f"{path}: configuration keys and values must be strings")
+        result[key] = item
+    return result
+
+
+def _save_config(cfg: dict[str, str]) -> None:
+    with atomic_text_writer(config_file()) as stream:
+        json.dump(cfg, stream, indent=2)
+        stream.write("\n")
 
 
 def get_config(key: str, default: str = "") -> str:
-    cfg = _load_config()
-    return cfg.get(key, default)
+    return _load_config().get(key, default)
 
 
-def set_config(key: str, value: str):
-    cfg = _load_config()
-    cfg[key] = value
-    _save_config(cfg)
+def update_config(values: dict[str, str]) -> None:
+    with file_lock(config_file().with_suffix(".lock")):
+        cfg = _load_config()
+        cfg.update(values)
+        _save_config(cfg)
+
+
+def set_config(key: str, value: str) -> None:
+    update_config({key: value})
 
 
 def get_data_dir() -> str:
     savedir = get_config("savedir")
     if savedir and os.path.isabs(savedir):
         return savedir
-    return _DEFAULT_DATA_DIR
+    return str(Path.home() / ".local" / "share" / "hiper")
