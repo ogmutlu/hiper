@@ -46,7 +46,7 @@ uv build
 
 Ty treats every diagnostic as an error and checks application code and tests.
 Ruff enforces annotations, modern Python syntax, import order, and bug checks.
-Runtime records use explicit `TypedDict` schemas. The only explicit `Any` is at
+Runtime records use explicit `TypedDict` schemas and immutable dataclasses. The only explicit `Any` is at
 the termios boundary, whose nested attributes are opaque operating-system values.
 
 ## Architecture
@@ -55,7 +55,9 @@ the termios boundary, whose nested attributes are opaque operating-system values
   and opens short data transactions declared by each command.
 - `commands/` coordinates workflows and presentation; command descriptors are
   immutable and require parser and execution callbacks.
-- `models.py` defines session, goal, book, log, and habit records.
+- `models.py` defines session, goal, book, log, habit, and tree node records.
+- `trees.py` validates tree structure and handles subtree totals, node mutations,
+  focus attribution, and Markdown notes for both interfaces.
 - `storage.py` validates and converts CSV records. Paths are resolved at runtime.
   Reads have no filesystem side effects. Worked time is derived from sessions
   in one pass, respecting the timestamp of the current estimate.
@@ -106,12 +108,12 @@ uv run hiper tui --title "Write chapter"
 ```
 
 The Textual interface shares the CLI's configuration and CSV files. It offers
-Focus, Goals, Reading, Habits, and Logs tabs, plus today's focus total and recent
+Focus, Trees, Goals, Reading, Habits, and Logs tabs, plus today's focus total and recent
 sessions. Select table rows with Enter or a mouse click before using their actions.
 Forms validate input and show errors in the status bar. File operations run in
 background threads so the timer and keyboard remain responsive.
 
-- F1–F5 switch tabs; Tab / Shift+Tab move between controls.
+- F1–F6 switch tabs; Tab / Shift+Tab move between controls.
 - Ctrl+Enter starts focus; Ctrl+P pauses or resumes; Ctrl+S saves the session.
 - Ctrl+R refreshes data written by other hiper processes.
 - Ctrl+Q quits. With an unsaved session, choose Save & quit, Discard & quit, or
@@ -142,3 +144,70 @@ session history associated with deleted goals and logs associated with habits.
 Deleted goals stay removed until you explicitly create them again. Session/log
 IDs are added to older CSVs on their next mutation; reading alone never rewrites
 files. Deletion cannot be undone.
+
+
+## Trees of goals
+
+```sh
+uv run hiper tree create "Thesis" --estimate 80h
+uv run hiper tree add "Thesis" --name "Research" --estimate 30h
+uv run hiper tree add "Thesis" "Research" --name "Read papers" --estimate 10h
+uv run hiper tree show "Thesis"
+uv run hiper tree focus "Thesis" "Research/Read papers" --goal 25m
+uv run hiper tree focus "Thesis" "Research"
+uv run hiper tree notes "Thesis" "Research/Read papers"
+```
+
+`hiper tree` lists all trees. Each root is the tree's name. Node paths are relative
+to the root; omit the path or use `/` to select the root. Names may contain spaces
+but not `/`, and sibling names must be unique. Different branches can reuse names.
+Every node can have an optional time estimate and a Markdown notes file.
+
+Focusing a leaf uses its name as the session title. Focusing a group (or the root)
+uses `General`. Sessions store a `group` column containing the full selected node
+path, for example `Thesis/Research/Read papers` or `Thesis/Research`. Stable
+`tree_id` and `node_id` columns preserve attribution when names change or when
+an existing leaf later gains children. Old sessions remain readable with empty
+group fields; columns are added on the next session mutation.
+
+A node's total is its direct focus time plus all its descendants' focus time.
+Each session counts once at each ancestor. Only sessions explicitly assigned to
+that tree and starting at or after the root's creation timestamp count. Existing
+flat goals and same-named goals in other trees are independent. Editing an
+estimate does not reset a tree's accounting period. Totals reflect saved sessions;
+the Focus tab shows the running timer until you save.
+
+More commands:
+
+```sh
+uv run hiper tree set "Thesis" "Research" --name "Literature" --estimate 35h
+uv run hiper tree set "Thesis" "Literature" --notes ~/notes/literature.md
+uv run hiper tree notes "Thesis" "Literature" --path
+uv run hiper tree log "Thesis" "Literature" --duration 30m --start 2026-10-04T09:00:00
+uv run hiper tree delete "Thesis" "Literature/Read papers"
+```
+
+`tree log` records a past session; its default start is now minus the duration.
+A session starting before the tree was created is saved in history but excluded
+from tree totals. Use `tree set --estimate 0s` to clear an estimate. `tree delete`
+removes the selected subtree (or the whole tree when the path is omitted), while
+keeping session history and notes files. Removed nodes no longer contribute to
+the remaining hierarchy's totals. Recreating a tree starts fresh with a new ID.
+
+In the TUI, **F2** opens Trees. Each tree has its own tab inside Trees. Click a
+node's name to select it; double-click, press Enter, or use the Focus button to
+start focus. Click its disclosure arrow or press Space to expand/collapse. Arrow keys select a
+node without starting focus, so you can add children, edit its name/estimate,
+open notes, or delete its subtree with confirmation. Save or discard an active
+session before starting another.
+
+Notes default to `notes/<tree> - <node>.md` in the data directory; root notes use
+`notes/<tree>.md`. Tree/node combinations are assumed unique. Renaming a node or
+tree keeps its existing notes file associated. Older ID-named notes are loaded
+and copied to the readable filename on the next save. CLI `tree notes` opens
+`$VISUAL`, then `$EDITOR`, falling back to `vi`; `--path` only prints the path.
+The TUI's **Open notes** opens an editor with Save and Cancel. Saving detects
+intervening edits on disk and keeps your text available if a conflict occurs.
+You may associate an existing `.md` file through `tree set --notes` or the TUI
+node form. Managed notes are included in `hiper backup`; externally associated
+files must be backed up separately.

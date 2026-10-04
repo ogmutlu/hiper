@@ -109,3 +109,34 @@ SessionDecision, DeleteDecision {
     min-width: 12;
     padding: 0 1;
 }
+
+TaskTree {
+    height: 16;
+    min-height: 5;
+    margin: 1 0;
+    border: round $accent;
+}
+#tree-selection {
+    height: auto;
+    color: $text-muted;
+    margin-bottom: 1;
+}
+NotesEditor {
+    align: center middle;
+    background: $background 75%;
+}
+#notes-dialog {
+    width: 90%;
+    height: 90%;
+    padding: 1 2;
+    border: round $accent;
+    background: $surface;
+}
+#notes-text {
+    height: 1fr;
+    margin: 1 0;
+}
+#notes-file, #notes-status {
+    height: auto;
+    max-height: 3;
+}

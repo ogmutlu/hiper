@@ -35,6 +35,7 @@ def load_builtin_commands() -> None:
         prefokus,
         read,
         set,
+        tree,
         tui,
     )
 
@@ -51,3 +52,4 @@ def load_builtin_commands() -> None:
     register_command(read.get_command())
     register_command(set.get_command())
     register_command(tui.get_command())
+    register_command(tree.get_command())

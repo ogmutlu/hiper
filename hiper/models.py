@@ -1,6 +1,7 @@
 """Typed records at the CSV/domain boundary; existing CSV formats stay stable."""
 
 import datetime as dt
+from dataclasses import dataclass
 from typing import TypedDict
 
 
@@ -11,6 +12,20 @@ class Session(TypedDict):
     end: dt.datetime
     duration: int
     comment: str
+    group: str
+    tree_id: str
+    node_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskNode:
+    id: str
+    tree_id: str
+    parent_id: str
+    name: str
+    created_at: dt.datetime
+    estimate_seconds: int = 0
+    notes_path: str = ""
 
 
 class Goal(TypedDict):

@@ -92,7 +92,7 @@ class TuiDeleteTests(IsolatedAsyncioTestCase):
                     await pilot.pause()
                     await pilot.click(f"#{kind}-delete")
                     self.assertIsInstance(app.screen, DeleteDecision)
-                    await pilot.press("ctrl+r", "ctrl+s", "f2", "escape")
+                    await pilot.press("ctrl+r", "ctrl+s", "f3", "escape")
                     await pilot.pause()
                     self.assertEqual(len(load()), 1)
                     await pilot.click(f"#{kind}-delete")

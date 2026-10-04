@@ -16,10 +16,12 @@ from tests.test_regressions import isolated
 
 
 @contextmanager
-def terminal_process(*args: str) -> Iterator[tuple[subprocess.Popen[bytes], int, int]]:
+def terminal_process(
+    *args: str, command: tuple[str, ...] = ("fokus",)
+) -> Iterator[tuple[subprocess.Popen[bytes], int, int]]:
     master, slave = os.openpty()
     process = subprocess.Popen(
-        [sys.executable, "-m", "hiper", "fokus", *args],
+        [sys.executable, "-m", "hiper", *command, *args],
         stdin=slave,
         stdout=slave,
         stderr=slave,

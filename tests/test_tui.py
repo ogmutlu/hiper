@@ -1,7 +1,7 @@
 import datetime as dt
 from unittest import IsolatedAsyncioTestCase, TestCase, mock
 
-from textual.widgets import Button, Input, TabbedContent
+from textual.widgets import Button, Input, TabbedContent, TabPane
 
 from hiper import storage
 from hiper.tui import services
@@ -54,10 +54,16 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
             app = HiperApp()
             async with app.run_test(size=(80, 24)) as pilot:
                 self.assertIsNotNone(app.snapshot)
+                self.assertEqual(
+                    [pane.id for pane in app.query(TabPane)],
+                    ["focus", "trees", "goals", "reading", "habits", "logs"],
+                )
+                await pilot.press("f2")
+                self.assertEqual(app.query_one(TabbedContent).active, "trees")
                 self.assertFalse((root / "data").exists())
-                await pilot.press("f3")
+                await pilot.press("f4")
                 self.assertEqual(app.query_one(TabbedContent).active, "reading")
-                await pilot.press("f5")
+                await pilot.press("f6")
                 self.assertEqual(app.query_one(TabbedContent).active, "logs")
 
     async def test_start_pause_resume_and_save_focus(self) -> None:
@@ -108,7 +114,7 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
         with isolated():
             app = HiperApp()
             async with app.run_test() as pilot:
-                await pilot.press("f5")
+                await pilot.press("f6")
                 message = app.query_one("#log-message", Input)
                 message.value = "[red]a note[/red]"
                 message.focus()
@@ -125,7 +131,7 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
             services.add_book("book", "100")
             app = HiperApp()
             async with app.run_test(size=(100, 45)) as pilot:
-                await pilot.press("f3")
+                await pilot.press("f4")
                 app.query_one("#books-table", RecordTable).focus()
                 await pilot.press("enter")
                 self.assertEqual(app.selected_book, "book")
@@ -178,7 +184,7 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
         with isolated():
             app = HiperApp()
             async with app.run_test(size=(100, 45)) as pilot:
-                await pilot.press("f2")
+                await pilot.press("f3")
                 app.query_one("#goal-title", Input).value = "project"
                 app.query_one("#goal-estimate", Input).value = "4h"
                 app.query_one("#goal-deadline", Input).value = "2026-12-01"
@@ -194,7 +200,7 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
         with isolated():
             app = HiperApp()
             async with app.run_test(size=(100, 45)) as pilot:
-                await pilot.press("f4")
+                await pilot.press("f5")
                 app.query_one("#habit-title", Input).value = "walk"
                 await pilot.click("#habit-add")
                 app.query_one("#habits-table", RecordTable).focus()
@@ -213,7 +219,7 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
             async with app.run_test(size=(60, 24)) as pilot:
                 await pilot.press("ctrl+enter", "ctrl+q")
                 decision = app.screen
-                await pilot.press("ctrl+p", "ctrl+s", "ctrl+r", "f3", "ctrl+q")
+                await pilot.press("ctrl+p", "ctrl+s", "ctrl+r", "f4", "ctrl+q")
                 self.assertIs(app.screen, decision)
                 self.assertIsNotNone(app.focus_session)
                 self.assertEqual(storage.load_sessions_csv(), [])
@@ -235,7 +241,7 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
         with isolated():
             app = HiperApp()
             async with app.run_test() as pilot:
-                await pilot.press("f5")
+                await pilot.press("f6")
                 await pilot.click("#log-add")
                 self.assertEqual(storage.load_log_csv(), [])
                 self.assertFalse(app.busy)

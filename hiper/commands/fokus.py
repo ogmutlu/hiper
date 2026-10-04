@@ -15,6 +15,7 @@ from ..terminal import (
     _restore_mode,
     _set_raw_mode,
 )
+from ..trees import TreeFocus, load_forest
 from . import Command
 
 
@@ -24,9 +25,17 @@ def _save_session_csv(
     end: dt.datetime,
     duration_s: int,
     comment: str | None = None,
+    tree_focus: TreeFocus | None = None,
 ) -> str:
     return storage.save_session_csv(
-        title or "", start, end, duration_s, comment=comment or ""
+        title or "",
+        start,
+        end,
+        duration_s,
+        comment=comment or "",
+        group=tree_focus.group if tree_focus else "",
+        tree_id=tree_focus.tree_id if tree_focus else "",
+        node_id=tree_focus.node_id if tree_focus else "",
     )
 
 
@@ -36,10 +45,11 @@ def _handle_save(
     end: dt.datetime,
     elapsed_s: int,
     comment: str | None = None,
+    tree_focus: TreeFocus | None = None,
 ) -> None:
     """Save the session and print confirmation messages."""
     _finalize_render()
-    path = _save_session_csv(title, start, end, elapsed_s, comment)
+    path = _save_session_csv(title, start, end, elapsed_s, comment, tree_focus)
     print(msgs.saved_session_line(_format_duration(elapsed_s)))
     print(msgs.saved_path_line(path))
 
@@ -118,8 +128,13 @@ def _parse_goal_command(cmd_line: str) -> tuple[bool, str | None, str | None]:
     return (True, duration, None)
 
 
-def fokus_configure_parser(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--title", "-t", help="Optional title for the session", default=None)
+def fokus_configure_parser(
+    p: argparse.ArgumentParser, *, include_title: bool = True
+) -> None:
+    if include_title:
+        p.add_argument(
+            "--title", "-t", help="Optional title for the session", default=None
+        )
     p.add_argument("--comment", help="Optional comment for the session", default=None)
     p.add_argument(
         "--goal",
@@ -136,7 +151,11 @@ def fokus_configure_parser(p: argparse.ArgumentParser) -> None:
         "--context",
         "-c",
         action="store_true",
-        help="Show cumulative time focused on this title across all sessions (requires --title)",
+        help=(
+            "Show cumulative time for this title (requires --title)"
+            if include_title
+            else "Show subtree time since tree creation"
+        ),
     )
     p.add_argument(
         "--online",
@@ -145,7 +164,7 @@ def fokus_configure_parser(p: argparse.ArgumentParser) -> None:
     )
 
 
-def fokus_run(args: argparse.Namespace) -> int:
+def fokus_run(args: argparse.Namespace, *, tree_focus: TreeFocus | None = None) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise ValueError("fokus requires an interactive terminal")
     comment = getattr(args, "comment", None)
@@ -163,12 +182,14 @@ def fokus_run(args: argparse.Namespace) -> int:
             return 1
     start = dt.datetime.now()
     _print_header(start)
+    if tree_focus:
+        print(f"Group: {tree_focus.group}")
     estimate_seconds: int | None = None
     time_worked_before: int | None = None
     estimate_bar_enabled = (
         config.get_config("estimate_bar", DEFAULT_ESTIMATE_BAR).lower() == "true"
     )
-    if estimate_bar_enabled and args.title:
+    if estimate_bar_enabled and args.title and tree_focus is None:
         try:
             goals = storage.load_goals_csv()
             for goal in goals:
@@ -186,12 +207,26 @@ def fokus_run(args: argparse.Namespace) -> int:
                     break
         except (OSError, ValueError) as e:
             print(f"Error: failed to load goals: {e}")
+    if tree_focus is not None:
+        forest = load_forest()
+        estimate_seconds = (
+            (forest.require(tree_focus.node_id).estimate_seconds or None)
+            if estimate_bar_enabled
+            else None
+        )
+        time_worked_before = forest.totals(storage.load_sessions_csv())[
+            tree_focus.node_id
+        ]
     context_time_before: int | None = None
     if args.context:
         if not args.title:
             print("Error: --context requires --title")
             return 1
-        context_time_before = storage.get_time_worked_for_title(args.title)
+        context_time_before = (
+            time_worked_before
+            if tree_focus
+            else storage.get_time_worked_for_title(args.title)
+        )
     today_time_before: int | None = None
     today_time_enabled = (
         config.get_config("today_time", DEFAULT_TODAY_TIME).lower() == "true"
@@ -403,14 +438,14 @@ def fokus_run(args: argparse.Namespace) -> int:
                 now = dt.datetime.now()
                 cmd = line.strip()
                 if cmd == "s":
-                    _handle_save(args.title, start, now, elapsed, comment)
+                    _handle_save(args.title, start, now, elapsed, comment, tree_focus)
                     break
                 is_save, title_override = _parse_save_command(cmd)
                 if is_save:
                     save_title = (
                         title_override if title_override is not None else args.title
                     )
-                    _handle_save(save_title, start, now, elapsed, comment)
+                    _handle_save(save_title, start, now, elapsed, comment, tree_focus)
                     break
                 is_goal, new_duration, goal_error = _parse_goal_command(cmd)
                 if is_goal:

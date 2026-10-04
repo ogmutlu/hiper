@@ -22,11 +22,12 @@ from textual.widgets import (
     TabPane,
 )
 
-from .. import storage
+from .. import storage, trees
 from ..habits import is_scheduled_today
 from ..timeutil import format_hms
 from . import services
 from .services import FocusSession, Snapshot
+from .tree_view import NotesEditor, TreePane
 
 
 class RecordTable(DataTable[Text]):
@@ -98,7 +99,7 @@ class HiperApp(App[None]):
         *[
             Binding(f"f{number}", f"show_tab('{tab}')", show=False, priority=True)
             for number, tab in enumerate(
-                ("focus", "goals", "reading", "habits", "logs"), 1
+                ("focus", "trees", "goals", "reading", "habits", "logs"), 1
             )
         ],
     ]
@@ -161,7 +162,8 @@ class HiperApp(App[None]):
                     yield Button(
                         "Delete selected session", id="session-delete", variant="error"
                     )
-            with TabPane("Goals  F2", id="goals"):
+            yield TreePane()
+            with TabPane("Goals  F3", id="goals"):
                 with VerticalScroll():
                     yield Static("Plan your next step", classes="section-title")
                     yield Static(
@@ -183,7 +185,7 @@ class HiperApp(App[None]):
                         placeholder="Deadline YYYY-MM-DD (optional)", id="goal-deadline"
                     )
                     yield Button("Save estimate", id="goal-save", variant="primary")
-            with TabPane("Reading  F3", id="reading"):
+            with TabPane("Reading  F4", id="reading"):
                 with VerticalScroll():
                     yield Static("One page at a time", classes="section-title")
                     yield Static(
@@ -214,7 +216,7 @@ class HiperApp(App[None]):
                         placeholder="Total pages", id="book-length", type="integer"
                     )
                     yield Button("Add book", id="book-add")
-            with TabPane("Habits  F4", id="habits"):
+            with TabPane("Habits  F5", id="habits"):
                 with VerticalScroll():
                     yield Static("Small things, consistently", classes="section-title")
                     yield Static(
@@ -239,7 +241,7 @@ class HiperApp(App[None]):
                         id="habit-frequency",
                     )
                     yield Button("Add habit", id="habit-add")
-            with TabPane("Logs  F5", id="logs"):
+            with TabPane("Logs  F6", id="logs"):
                 with VerticalScroll():
                     yield Static("Leave yourself a note", classes="section-title")
                     yield Input(
@@ -252,7 +254,7 @@ class HiperApp(App[None]):
                         "Delete selected log", id="log-delete", variant="error"
                     )
         yield Static(
-            "Tab moves between controls · F1–F5 switches views",
+            "Tab moves between controls · F1–F6 switches views",
             id="status",
             markup=False,
         )
@@ -304,7 +306,7 @@ class HiperApp(App[None]):
                     table.move_cursor(row=index)
                     break
 
-    def _render_snapshot(self, snapshot: Snapshot) -> None:
+    async def _render_snapshot(self, snapshot: Snapshot) -> None:
         self.snapshot = snapshot
         total = sum(session["duration"] for session in snapshot.sessions)
         self.query_one("#summary", Static).update(
@@ -314,7 +316,7 @@ class HiperApp(App[None]):
         sessions = sorted(snapshot.sessions, key=lambda s: s["start"], reverse=True)
         self._fill_table(
             "sessions-table",
-            ("Started", "Title", "Focus time", "Comment"),
+            ("Started", "Title", "Focus time", "Comment", "Group"),
             [
                 (
                     s["id"],
@@ -323,6 +325,7 @@ class HiperApp(App[None]):
                         s["title"] or "Untitled",
                         format_hms(s["duration"]),
                         s["comment"],
+                        s["group"],
                     ),
                 )
                 for s in sessions
@@ -397,6 +400,9 @@ class HiperApp(App[None]):
             ("When", "Message"),
             [(log["id"], (str(log["timestamp"])[:16], log["message"])) for log in logs],
         )
+        await self.query_one(TreePane).render_forest(
+            snapshot.forest, snapshot.forest.totals(snapshot.sessions)
+        )
         if self.selected_session not in {s["id"] for s in snapshot.sessions}:
             self.selected_session = None
         if self.selected_log not in {log["id"] for log in snapshot.logs}:
@@ -417,9 +423,9 @@ class HiperApp(App[None]):
         self.busy = True
         try:
             snapshot = await self._io(services.load_snapshot)
-            self._render_snapshot(snapshot)
+            await self._render_snapshot(snapshot)
             self._set_status(
-                "Workspace refreshed · Tab to navigate · F1–F5 to switch views"
+                "Workspace refreshed · Tab to navigate · F1–F6 to switch views"
             )
         except (OSError, ValueError) as exc:
             self._set_status(f"Could not load workspace: {exc}", error=True)
@@ -440,7 +446,7 @@ class HiperApp(App[None]):
         else:
             # A refresh failure must never turn a successful mutation into a retry.
             try:
-                self._render_snapshot(await self._io(services.load_snapshot))
+                await self._render_snapshot(await self._io(services.load_snapshot))
             except (OSError, ValueError) as exc:
                 message += f" · Refresh failed: {exc}"
             self._set_status(message)
@@ -450,6 +456,7 @@ class HiperApp(App[None]):
             self._sync_controls()
 
     def _sync_controls(self) -> None:
+        self.query_one(TreePane).set_busy(self.busy)
         active = self.focus_session is not None
         for field in self.query(Input):
             field.disabled = self.busy or (
@@ -520,6 +527,8 @@ class HiperApp(App[None]):
                     if remaining
                     else "Target reached"
                 )
+            if session.group:
+                detail += f"\nGroup: {session.group}"
             if session.comment:
                 detail += f"\n{session.comment}"
         self.query_one("#session-detail", Static).update(detail)
@@ -534,6 +543,7 @@ class HiperApp(App[None]):
             "reading": "books-table",
             "habits": "habits-table",
             "logs": "log-message",
+            "trees": "task-tree",
         }[tab]
         self.query_one(f"#{identifier}").focus()
 
@@ -708,6 +718,73 @@ class HiperApp(App[None]):
             await self._perform(lambda: services.complete_habit(title))
         elif identifier == "log-add":
             await self._add_log()
+
+    @on(TreePane.MutationRequested)
+    async def mutate_tree(self, event: TreePane.MutationRequested) -> None:
+        if not isinstance(self.screen, ModalScreen):
+            await self._perform(event.operation)
+
+    @on(TreePane.FocusRequested)
+    async def focus_tree(self, event: TreePane.FocusRequested) -> None:
+        if self.busy or isinstance(self.screen, ModalScreen):
+            return
+        if self.focus_session is not None:
+            self._set_status(
+                "Save or discard your current session before starting another.",
+                error=True,
+            )
+            return
+        self.busy = True
+        self._sync_controls()
+        try:
+            session = await self._io(
+                lambda: services.create_tree_focus(event.identifier)
+            )
+            self.focus_session = session
+            self.query_one("#focus-title", Input).value = session.title
+            self.query_one("#focus-comment", Input).value = ""
+            self.query_one("#focus-target", Input).value = ""
+            self.action_show_tab("focus")
+            self._set_status(f"Focusing on {session.group} · Ctrl+S saves")
+        except (OSError, ValueError) as exc:
+            self._set_status(str(exc), error=True)
+        finally:
+            self.busy = False
+            self._sync_controls()
+            self.query_one("#focus-pause", Button).focus()
+
+    @on(TreePane.DeleteRequested)
+    def delete_tree(self, event: TreePane.DeleteRequested) -> None:
+        if self.busy or isinstance(self.screen, ModalScreen):
+            return
+
+        async def confirmed(answer: bool | None) -> None:
+            if answer:
+                await self._perform(lambda: trees.delete_node(event.identifier))
+
+        self.push_screen(
+            DeleteDecision(f"{event.description} and all descendants"), confirmed
+        )
+
+    @on(TreePane.NotesRequested)
+    async def open_tree_notes(self, event: TreePane.NotesRequested) -> None:
+        if self.busy or isinstance(self.screen, ModalScreen):
+            return
+        self.busy = True
+        self._sync_controls()
+        try:
+            document = await self._io(lambda: trees.open_notes(event.identifier))
+        except (OSError, ValueError) as exc:
+            self._set_status(str(exc), error=True)
+        else:
+
+            async def save(text: str) -> None:
+                await self._io(lambda: trees.save_notes(document, text))
+
+            self.push_screen(NotesEditor(document, save))
+        finally:
+            self.busy = False
+            self._sync_controls()
 
     @override
     async def action_quit(self) -> None:

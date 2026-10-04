@@ -3,7 +3,7 @@
 import datetime as dt
 from dataclasses import dataclass, field
 
-from .. import config, storage
+from .. import config, storage, trees
 from ..defaults import DEFAULT_WORK_PER_DAY
 from ..habits import match_habit, parse_frequency
 from ..models import Book, Goal, Habit, LogEntry, Session
@@ -20,6 +20,7 @@ class Snapshot:
     habits: list[Habit]
     logs: list[LogEntry]
     data_dir: str
+    forest: trees.TaskForest
 
     @property
     def today_seconds(self) -> int:
@@ -48,6 +49,7 @@ def load_snapshot() -> Snapshot:
         storage.load_habits_csv(),
         storage.load_log_csv(),
         storage.get_data_dir(),
+        trees.load_forest(),
     )
 
 
@@ -59,6 +61,9 @@ class FocusSession:
     started: dt.datetime = field(default_factory=dt.datetime.now)
     clock: SessionClock = field(default_factory=SessionClock)
     paused: bool = False
+    group: str = ""
+    tree_id: str = ""
+    node_id: str = ""
 
     def toggle_pause(self) -> None:
         if self.paused:
@@ -73,7 +78,14 @@ class FocusSession:
         self.paused = True
         seconds = self.clock.seconds
         storage.save_session_csv(
-            self.title, self.started, dt.datetime.now(), seconds, self.comment
+            self.title,
+            self.started,
+            dt.datetime.now(),
+            seconds,
+            self.comment,
+            group=self.group,
+            tree_id=self.tree_id,
+            node_id=self.node_id,
         )
         return f"Saved {self.title or 'session'} · {format_hms(seconds)}"
 
@@ -214,3 +226,10 @@ def add_log(message: str) -> str:
         raise ValueError("log message cannot be empty")
     storage.append_log_csv(message)
     return "Added log entry"
+
+
+def create_tree_focus(identifier: str) -> FocusSession:
+    target = trees.focus_target(identifier)
+    return FocusSession(
+        target.title, group=target.group, tree_id=target.tree_id, node_id=target.node_id
+    )

@@ -24,7 +24,7 @@ def run(args: argparse.Namespace) -> int:
     if kind == "session":
         for session in storage.load_sessions_csv():
             print(
-                f"{session['id']}\t{session['start']}\t{session['title']}\t{session['duration']}s"
+                f"{session['id']}\t{session['start']}\t{session['title']}\t{session['duration']}s\t{session['group']}"
             )
     elif kind == "log":
         for log in storage.load_log_csv():

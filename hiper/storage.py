@@ -19,7 +19,7 @@ from uuid import uuid4
 from . import config
 from .files import atomic_text_writer
 from .locking import file_lock
-from .models import Book, Goal, Habit, LogEntry, Session
+from .models import Book, Goal, Habit, LogEntry, Session, TaskNode
 from .timeutil import format_hms, local_datetime, parse_duration
 
 __all__ = [
@@ -52,6 +52,9 @@ SESSION_FIELDS = (
     "duration",
     "duration_formatted",
     "comment",
+    "group",
+    "tree_id",
+    "node_id",
 )
 GOAL_FIELDS = (
     "title",
@@ -67,6 +70,15 @@ BOOK_FIELDS = ("title", "length", "current_page", "time_per_page_seconds")
 HABIT_FIELDS = ("name", "frequency", "created_at")
 LOG_FIELDS = ("message", "timestamp", "id")
 LOG_REQUIRED = ("message", "timestamp")
+TREE_FIELDS = (
+    "id",
+    "tree_id",
+    "parent_id",
+    "name",
+    "created_at",
+    "estimate_seconds",
+    "notes_path",
+)
 
 
 def get_data_dir() -> str:
@@ -175,6 +187,9 @@ def load_sessions_csv() -> list[Session]:
                 end=end,
                 duration=duration,
                 comment=row.get("comment", ""),
+                group=row.get("group", ""),
+                tree_id=row.get("tree_id", ""),
+                node_id=row.get("node_id", ""),
             )
         )
     return sessions
@@ -187,6 +202,10 @@ def save_session_csv(
     end: dt.datetime,
     duration_seconds: int,
     comment: str = "",
+    *,
+    group: str = "",
+    tree_id: str = "",
+    node_id: str = "",
 ) -> str:
     start = local_datetime(start.isoformat())
     end = local_datetime(end.isoformat())
@@ -212,6 +231,9 @@ def save_session_csv(
             "duration": str(duration_seconds),
             "duration_formatted": format_hms(duration_seconds),
             "comment": comment,
+            "group": group,
+            "tree_id": tree_id,
+            "node_id": node_id,
         }
     )
     # Old hand-written CSVs may lack the derived duration column.
@@ -241,7 +263,9 @@ def _worked(sessions: Sequence[Session], title: str, after: dt.datetime | None) 
     return sum(
         row["duration"]
         for row in sessions
-        if row["title"].strip() == title and (after is None or row["start"] >= after)
+        if not row["tree_id"]
+        and row["title"].strip() == title
+        and (after is None or row["start"] >= after)
     )
 
 
@@ -279,7 +303,9 @@ def load_goals_csv() -> list[Goal]:
             start_by=dt.date.fromisoformat(start_by) if start_by else None,
         )
     sessions = load_sessions_csv()
-    for title in sorted({row["title"].strip() for row in sessions} - {""}):
+    for title in sorted(
+        {row["title"].strip() for row in sessions if not row["tree_id"]} - {""}
+    ):
         if title not in goals and title not in deleted:
             goals[title] = Goal(
                 title=title,
@@ -501,3 +527,38 @@ def delete_record(kind: str, key: str) -> str:
         )
         _write(name, fields, [row for row in rows if row is not matches[0]])
     return f"Deleted {kind}: {key}"
+
+
+def load_tree_nodes_csv() -> list[TaskNode]:
+    return [
+        TaskNode(
+            id=row["id"],
+            tree_id=row["tree_id"],
+            parent_id=row["parent_id"],
+            name=row["name"],
+            created_at=local_datetime(row["created_at"]),
+            estimate_seconds=_integer(row, "estimate_seconds"),
+            notes_path=row.get("notes_path", ""),
+        )
+        for row in _rows("trees.csv", TREE_FIELDS[:5])
+    ]
+
+
+@_locked
+def save_tree_nodes_csv(nodes: Sequence[TaskNode]) -> str:
+    return _write(
+        "trees.csv",
+        TREE_FIELDS,
+        [
+            {
+                "id": node.id,
+                "tree_id": node.tree_id,
+                "parent_id": node.parent_id,
+                "name": node.name,
+                "created_at": node.created_at.isoformat(),
+                "estimate_seconds": node.estimate_seconds,
+                "notes_path": node.notes_path,
+            }
+            for node in nodes
+        ],
+    )
