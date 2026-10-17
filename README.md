@@ -211,3 +211,10 @@ intervening edits on disk and keeps your text available if a conflict occurs.
 You may associate an existing `.md` file through `tree set --notes` or the TUI
 node form. Managed notes are included in `hiper backup`; externally associated
 files must be backed up separately.
+
+## Hyperforest
+
+Hyperforest is now a separate Rust/TypeScript application and Git checkout in
+[hyperforest/](hyperforest/README.md), with its own documentation, build, tests,
+and GitHub repository: [ogmutlu/hyperforest](https://github.com/ogmutlu/hyperforest).
+The Python hiper CLI and TUI above are independent of it.

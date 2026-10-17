@@ -1,4 +1,6 @@
+import asyncio
 import datetime as dt
+import threading
 from unittest import IsolatedAsyncioTestCase, TestCase, mock
 
 from textual.widgets import Button, Input, TabbedContent, TabPane
@@ -7,6 +9,7 @@ from hiper import storage
 from hiper.tui import services
 from hiper.tui.app import HiperApp, RecordTable, SessionDecision
 from tests.test_regressions import isolated, run_cli
+from tests.tui_helpers import wait_for_app
 
 
 class TuiServiceTests(TestCase):
@@ -82,6 +85,7 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
                 await pilot.press("ctrl+p")
                 self.assertFalse(session.paused)
                 await pilot.press("ctrl+s")
+                await wait_for_app(pilot)
                 self.assertIsNone(app.focus_session)
                 self.assertFalse(app.query_one("#focus-title", Input).disabled)
                 sessions = storage.load_sessions_csv()
@@ -102,11 +106,13 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
                     side_effect=OSError("disk unavailable"),
                 ):
                     await pilot.press("ctrl+s")
+                    await wait_for_app(pilot)
                 self.assertIs(app.focus_session, session)
                 assert session is not None
                 self.assertTrue(session.paused)
                 self.assertEqual(storage.load_sessions_csv(), [])
                 await pilot.press("ctrl+s")
+                await wait_for_app(pilot)
                 self.assertIsNone(app.focus_session)
                 self.assertEqual(len(storage.load_sessions_csv()), 1)
 
@@ -119,6 +125,7 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
                 message.value = "[red]a note[/red]"
                 message.focus()
                 await pilot.press("enter")
+                await wait_for_app(pilot)
                 self.assertEqual(
                     storage.load_log_csv()[0]["message"], "[red]a note[/red]"
                 )
@@ -137,7 +144,28 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
                 self.assertEqual(app.selected_book, "book")
                 app.query_one("#book-page", Input).value = "10"
                 app.query_one("#book-time", Input).value = "30s"
-                await pilot.click("#book-update")
+                update_book = services.update_book
+                loop = asyncio.get_running_loop()
+                started = asyncio.Event()
+                release = threading.Event()
+
+                def delayed_update(title: str, page: str, timing: str) -> str:
+                    loop.call_soon_threadsafe(started.set)
+                    if not release.wait(timeout=10):
+                        raise TimeoutError("Test did not release the book update")
+                    return update_book(title, page, timing)
+
+                with mock.patch.object(
+                    services, "update_book", side_effect=delayed_update
+                ):
+                    try:
+                        await pilot.click("#book-update")
+                        await asyncio.wait_for(started.wait(), timeout=5)
+                        self.assertTrue(app.busy)
+                        self.assertEqual(storage.load_read_csv()[0]["current_page"], 0)
+                    finally:
+                        release.set()
+                        await wait_for_app(pilot)
                 self.assertEqual(storage.load_read_csv()[0]["current_page"], 10)
                 await pilot.click("#book-focus")
                 self.assertEqual(app.query_one(TabbedContent).active, "focus")
@@ -154,6 +182,7 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
                 self.assertIsNotNone(app.focus_session)
                 await pilot.press("ctrl+q")
                 await pilot.click("#decision-save")
+                await wait_for_app(pilot)
                 self.assertEqual(len(storage.load_sessions_csv()), 1)
                 self.assertIsNone(app.focus_session)
 
@@ -175,6 +204,7 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
                     side_effect=ValueError("broken books"),
                 ):
                     await pilot.press("ctrl+s")
+                    await wait_for_app(pilot)
                 self.assertIsNone(app.focus_session)
                 self.assertEqual(len(storage.load_sessions_csv()), 1)
                 await pilot.press("ctrl+s")
@@ -189,11 +219,13 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
                 app.query_one("#goal-estimate", Input).value = "4h"
                 app.query_one("#goal-deadline", Input).value = "2026-12-01"
                 await pilot.click("#goal-save")
+                await wait_for_app(pilot)
                 self.assertEqual(storage.load_goals_csv()[0]["estimate_seconds"], 14400)
                 app.query_one("#goals-table", RecordTable).focus()
                 await pilot.press("enter")
                 self.assertEqual(app.selected_goal, "project")
                 await pilot.click("#goal-finish")
+                await wait_for_app(pilot)
                 self.assertEqual(storage.load_goals_csv()[0]["estimate_seconds"], 0)
 
     async def test_habit_form_and_completion(self) -> None:
@@ -203,10 +235,13 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
                 await pilot.press("f5")
                 app.query_one("#habit-title", Input).value = "walk"
                 await pilot.click("#habit-add")
+                await wait_for_app(pilot)
                 app.query_one("#habits-table", RecordTable).focus()
                 await pilot.press("enter")
                 await pilot.click("#habit-complete")
+                await wait_for_app(pilot)
                 await pilot.click("#habit-complete")
+                await wait_for_app(pilot)
                 self.assertEqual(len(storage.load_log_csv()), 1)
                 self.assertEqual(
                     app.query_one("#habits-table", RecordTable).get_row_at(0)[2].plain,
@@ -243,6 +278,7 @@ class TuiInteractionTests(IsolatedAsyncioTestCase):
             async with app.run_test() as pilot:
                 await pilot.press("f6")
                 await pilot.click("#log-add")
+                await wait_for_app(pilot)
                 self.assertEqual(storage.load_log_csv(), [])
                 self.assertFalse(app.busy)
                 self.assertFalse(app.query_one("#log-add", Button).disabled)
